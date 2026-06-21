@@ -1,0 +1,19 @@
+# Globex Agent — Phase 1 依赖
+
+# LLM & Agent 框架
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langgraph>=0.2.0
+
+# 配置
+python-dotenv>=1.0.0
+
+# 底层 SDK（langchain-openai 依赖）
+openai>=1.50.0
+
+# 后续 Phase 会加：
+# fastapi
+# uvicorn
+# redis
+# chromadb / faiss
+# etc.

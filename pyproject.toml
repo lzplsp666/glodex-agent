@@ -1,0 +1,5 @@
+[project]
+name = "glodex-agent"
+version = "0.1.0"
+description = "Glodex Agent - 跨平台电商选品与比价多智能体系统"
+requires-python = ">=3.11"
