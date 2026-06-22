@@ -1,174 +1,224 @@
-# ============================================================
-# main_agent.py — AgentLoop 主循环
-# ============================================================
-#
-# 职责：把 LLM + 工具 + 子 Agent 串成一个"边想边做"的循环。
-# 框架：LangGraph（StateGraph 有向图 + 条件路由）
-#
-# 流程：
-#   用户输入
-#     → agent_node（LLM 思考）
-#         → 决定调工具 → tool_node（执行）
-#             → 结果回到 agent_node（继续思考）
-#         → 没有工具调用了 → 结束，返回答案
-# ============================================================
+"""Glodex Agent 第一阶段主循环。
+
+这一版刻意不依赖真实 LLM，也不访问真实电商 API。它用 LangGraph 搭出
+主 AgentLoop 的骨架，并通过 mock 工具跑通：
+
+用户输入 -> 规划 -> 搜索候选 -> fork 三个筛选目标 -> 合并 -> 比价 -> 总结
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from uuid import uuid4
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langgraph.graph import END, StateGraph
+
+from app.agent.fork import ForkRequest, ForkResult, new_child_thread_id
+from app.agent.state import AgentState, create_initial_context
+from app.tools import (
+    build_shopping_summary,
+    compare_prices,
+    filter_items,
+    plan_task,
+    search_items,
+)
 
 
-# ============================================================
-# 1. AgentState — 在图中流动的共享状态
-# ============================================================
+class GlodexAgent:
+    """主 AgentLoop。
 
-class AgentState:
+    第一阶段重点是“架构能跑起来”，所以每个节点都是确定性逻辑。
+    后续接入真实 LLM 时，可以把 `_plan_node` 和 `_summary_node`
+    替换成 LLM 调用，把 mock 工具替换成 LangChain Tool。
     """
-    messages : 对话历史列表
-        - 每条是 HumanMessage / AIMessage / ToolMessage
-        - 新消息追加到末尾，不覆盖旧消息
-    context  : 附加信息
-        - 用户偏好、长期记忆、历史上下文等（后续扩展）
-    """
+
+    def __init__(self, *, system_prompt: str | None = None) -> None:
+        self.system_prompt = system_prompt or "你是 Glodex Agent，负责电商选品与比价。"
+        self._graph = None
+
+    @property
+    def graph(self):
+        """延迟构建并复用 LangGraph 图。"""
+
+        if self._graph is None:
+            self._graph = self._build_graph()
+        return self._graph
+
+    def _build_graph(self):
+        """构建第一阶段固定流程图。"""
+
+        builder = StateGraph(AgentState)
+        builder.add_node("plan", self._plan_node)
+        builder.add_node("search", self._search_node)
+        builder.add_node("fork", self._fork_node)
+        builder.add_node("compare", self._compare_node)
+        builder.add_node("summary", self._summary_node)
+
+        builder.set_entry_point("plan")
+        builder.add_edge("plan", "search")
+        builder.add_edge("search", "fork")
+        builder.add_edge("fork", "compare")
+        builder.add_edge("compare", "summary")
+        builder.add_edge("summary", END)
+        return builder.compile()
+
+    def _plan_node(self, state: AgentState) -> dict[str, Any]:
+        """规划节点：从用户输入中抽取约束和 fork 子目标。"""
+
+        task = self._last_user_message(state["messages"])
+        plan = plan_task(task)
+        context = dict(state["context"])
+        context["constraints"] = plan["constraints"]
+        context["trace"] = [
+            *context.get("trace", []),
+            {"node": "plan", "summary": "完成需求解析和子目标规划。"},
+        ]
+        return {
+            "messages": [
+                AIMessage(content=f"已规划任务，准备处理 {len(plan['fork_goals'])} 个子目标。")
+            ],
+            "context": context,
+        }
+
+    def _search_node(self, state: AgentState) -> dict[str, Any]:
+        """搜索节点：用 mock 工具生成候选商品。"""
+
+        task = self._last_user_message(state["messages"])
+        items = search_items(task)
+        context = dict(state["context"])
+        context["candidate_items"] = items
+        context["trace"] = [
+            *context.get("trace", []),
+            {"node": "search", "summary": f"获得 {len(items)} 个候选商品。"},
+        ]
+        return {
+            "messages": [AIMessage(content=f"已获得 {len(items)} 个候选商品。")],
+            "context": context,
+        }
+
+    def _fork_node(self, state: AgentState) -> dict[str, Any]:
+        """Fork 节点：模拟三个同质子 Agent 并行筛选。"""
+
+        context = dict(state["context"])
+        parent_thread_id = context["thread_id"]
+        items = context.get("candidate_items", [])
+        constraints = context.get("constraints", {})
+
+        requests = [
+            ForkRequest(task="筛选预算约束", goal="budget_filter", input=constraints),
+            ForkRequest(task="筛选材质约束", goal="material_filter", input=constraints),
+            ForkRequest(task="筛选风格约束", goal="style_filter", input=constraints),
+        ]
+
+        results: list[dict[str, Any]] = []
+        for request in requests:
+            child_thread_id = new_child_thread_id(parent_thread_id, request.goal)
+            output = filter_items(goal=request.goal, items=items, constraints=constraints)
+            result = ForkResult(
+                goal=request.goal,
+                status="ok",
+                output={**output, "child_thread_id": child_thread_id},
+                summary=str(output["summary"]),
+                confidence=0.9,
+            )
+            results.append(result.model_dump())
+
+        context["fork_results"] = results
+        context["trace"] = [
+            *context.get("trace", []),
+            {"node": "fork", "summary": f"完成 {len(results)} 个同质子目标。"},
+        ]
+        return {
+            "messages": [AIMessage(content=f"已完成 {len(results)} 个 fork 子目标。")],
+            "context": context,
+        }
+
+    def _compare_node(self, state: AgentState) -> dict[str, Any]:
+        """合并与比价节点：取 fork 结果交集，再按总价排序。"""
+
+        context = dict(state["context"])
+        items = context.get("candidate_items", [])
+        fork_results = context.get("fork_results", [])
+
+        matched_sets = [
+            set(result["output"].get("matched_item_ids", []))
+            for result in fork_results
+            if result.get("status") == "ok"
+        ]
+        if matched_sets:
+            matched_ids = set.intersection(*matched_sets)
+        else:
+            matched_ids = {item["item_id"] for item in items}
+
+        merged_items = [item for item in items if item["item_id"] in matched_ids]
+        compared_items = compare_prices(merged_items)
+        context["ranked_items"] = compared_items
+        context["trace"] = [
+            *context.get("trace", []),
+            {"node": "compare", "summary": f"合并后剩余 {len(compared_items)} 个商品。"},
+        ]
+        return {
+            "messages": [AIMessage(content=f"合并筛选后剩余 {len(compared_items)} 个商品。")],
+            "context": context,
+        }
+
+    def _summary_node(self, state: AgentState) -> dict[str, Any]:
+        """总结节点：生成最终 Markdown 采购建议。"""
+
+        context = dict(state["context"])
+        ranked_items = context.get("ranked_items", [])
+        summary = build_shopping_summary(ranked_items)
+        context["final_summary"] = summary
+        context["trace"] = [
+            *context.get("trace", []),
+            {"node": "summary", "summary": "已生成最终采购建议。"},
+        ]
+        return {
+            "messages": [AIMessage(content=summary)],
+            "context": context,
+        }
+
+    def run(
+        self,
+        task: str,
+        *,
+        thread_id: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> AgentState:
+        """同步执行一次完整第一阶段流程。"""
+
+        actual_thread_id = thread_id or self.new_thread_id()
+        initial_state: AgentState = {
+            "messages": [
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=task),
+            ],
+            "context": create_initial_context(
+                thread_id=actual_thread_id,
+                extra=context,
+            ),
+        }
+        config = {"configurable": {"thread_id": actual_thread_id}}
+        return self.graph.invoke(initial_state, config)
+
+    @staticmethod
+    def new_thread_id() -> str:
+        """生成主任务 thread_id。"""
+
+        return f"th_{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _last_user_message(messages: list[BaseMessage]) -> str:
+        """获取最近一条用户消息。"""
+
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                return str(message.content)
+        return ""
 
 
-# ============================================================
-# 2. GlobexAgent — 主 Agent
-# ============================================================
+def create_agent(**kwargs: Any) -> GlodexAgent:
+    """创建主 Agent，供 API 和测试复用。"""
 
-class GlobexAgent:
-
-    # ---- 内部属性 ----
-    # self.tools          : 工具列表
-    # self.llm            : LLM 连接（调 get_llm() 得到）
-    # self.system_prompt  : 系统提示词
-    # self.checkpointer   : 状态持久化（默认内存，可换 Redis）
-    # self._graph         : 编译好的 LangGraph 图（懒加载）
-
-
-    # === 初始化 ===
-
-    def __init__(tools, model, system_prompt):
-        """
-        装配：存工具列表、建 LLM 连接、设提示词、准备持久化。
-        图不马上建，第一次用时再建（懒加载）。
-        """
-
-
-    # === 图构建 ===
-
-    def graph():
-        """
-        属性，懒加载：
-        第一次访问才调 _build() 构建 StateGraph，之后复用同一个。
-        """
-
-    def _build():
-        """
-        用 LangGraph 搭图：
-
-        1. llm_with_tools = llm.bind_tools(tools)    ← 给 LLM 绑工具定义
-        2. builder = StateGraph(AgentState)          ← 建图
-        3. builder.add_node("agent", _agent_node)    ← 加思考节点
-        4. builder.add_node("tools", _tool_node)     ← 加执行节点
-        5. builder.set_entry_point("agent")          ← 入口
-        6. builder.add_conditional_edges(
-               "agent",                              ← 从 agent 出发
-               _route,                               ← 判断函数
-               {"tools" → "tools",  END → END}       ← 两条路
-           )
-        7. builder.add_edge("tools", "agent")         ← 执行完回到思考
-        8. return builder.compile(checkpointer)       ← 编译
-        """
-
-
-    # === 节点：LLM 推理 ===
-
-    def _agent_node(state):
-        """
-        输入 state
-          → 取 messages
-          → 确保第一条是系统提示词（没有就插进去）
-          → llm_with_tools.invoke(messages)
-          → LLM 返回一条 AI 消息（可能含 tool_calls，也可能是最终回答）
-          → 返回 {"messages": [AI消息]}
-        """
-
-
-    # === 节点：工具执行 ===
-
-    def _tool_node(state):
-        """
-        输入 state
-          → 取最后一条消息的 tool_calls
-          → 遍历：
-              每个 tool_call 调 _dispatch(tool_call)
-              结果包成 ToolMessage(content=结果, tool_call_id=id)
-          → 返回 {"messages": [ToolMessage, ToolMessage, ...]}
-        """
-
-
-    # === 路由 ===
-
-    def _route(state):
-        """
-        看最后一条 AI 消息：
-          有 tool_calls → return "tools"   （继续干活）
-          没有          → return END        （出答案了）
-        """
-
-
-    # === 工具分发 ===
-
-    def _dispatch(tool_call):
-        """
-        看 tool_call 名字：
-          == "fork_agent"   → _fork_sub_agent(sub_agent=..., task=...)
-          在 self.tools 里  → tool.invoke(args)
-          都不在             → "[Error] 工具未注册"
-        """
-
-
-    # === Fork 子 Agent ===
-
-    def _fork_sub_agent(sub_agent, task):
-        """
-        Phase 1：返回占位信息
-        Phase 2：
-          1. get_registry().fork(sub_agent, task)
-          2. 子 Agent 编译自己的图 → 执行 → 返回结果
-        """
-
-
-    # ============================================================
-    # 3. 对外 API
-    # ============================================================
-
-    def run(task, thread_id):
-        """
-        同步执行任务，等所有步骤走完才返回。
-
-        输入："帮我找蓝牙耳机"
-        输出：{"messages": [...]}  最后一条就是给用户的答案
-
-        内部：
-          config = {"configurable": {"thread_id": thread_id}}
-          state  = {"messages": [HumanMessage(task)]}
-          return self.graph.invoke(state, config)
-        """
-
-    async def astream(task, thread_id):
-        """
-        异步流式执行，边想边往外推事件。
-        前端用 WebSocket / SSE 接。
-        """
-
-    def get_history(thread_id):
-        """
-        查某个会话的历史消息。
-        用 thread_id 区分不同用户/会话。
-        """
-
-
-# ============================================================
-# 4. 工厂函数
-# ============================================================
-
-def create_agent(tools, model) -> GlobexAgent:
-    """一行创建 Agent 实例。"""
+    return GlodexAgent(**kwargs)

@@ -1,0 +1,12 @@
+.git
+.idea
+.venv
+.uv-cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ruff_cache
+app/output
+frontend/node_modules

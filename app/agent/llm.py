@@ -1,50 +1,48 @@
-"""大模型客户端。
+"""LLM 客户端工厂。
 
-使用 LangChain ChatOpenAI 封装，兼容所有 OpenAI 格式的 API。
-切模型只改 .env，不动代码。
-
-Usage:
-    from app.agent.llm import get_llm, get_llm_info
+第一阶段默认不依赖真实 LLM。这里保留标准工厂函数，方便后续切换到
+OpenAI 兼容接口时不改调用方。
 """
 
-# import os
-# from typing import Optional
-# from dotenv import load_dotenv
-# from langchain_openai import ChatOpenAI
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from dotenv import load_dotenv
 
 
+def get_llm(
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> Any:
+    """创建 LangChain ChatOpenAI 客户端。
 
-def get_llm(model=None, base_url=None, api_key=None, temperature=None, max_tokens=None):
-    """创建 LLM 客户端实例，返回 ChatOpenAI 对象。
-
-    优先级：传参 > 环境变量 > 默认值
-
-    Args:
-        model:       模型名（qwen-plus / deepseek-chat / doubao-1.5-pro ...）
-        base_url:    API 地址
-        api_key:     API Key
-        temperature: 温度 0~1，越大越随机
-        max_tokens:  最大输出 token 数
-
-    Returns:
-        ChatOpenAI 实例
-
-    实现思路：
-        1. load_dotenv() 读 .env
-        2. 每个参数：先取传参，None 则取 os.getenv("LLM_XXX")，再 None 则用默认值
-        3. temperature / max_tokens 用 is not None 判断（0 是合法值）
-        4. 调用 ChatOpenAI(model=..., base_url=..., api_key=..., ...)
+    注意：第一阶段主 Agent 不调用这个函数，因此没有配置 API Key 也能运行。
+    真正需要 LLM 时再调用，缺依赖或缺 Key 的错误会在这里暴露。
     """
-    ...
+
+    load_dotenv()
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(
+        model=model or os.getenv("LLM_MODEL", "deepseek-chat"),
+        base_url=base_url or os.getenv("LLM_BASE_URL"),
+        api_key=api_key or os.getenv("LLM_API_KEY"),
+        temperature=0 if temperature is None else temperature,
+        max_tokens=max_tokens,
+    )
 
 
-def get_llm_info():
-    """查看当前 LLM 配置（不含 API Key，安全）。
+def get_llm_info() -> dict[str, str | None]:
+    """返回当前 LLM 配置摘要，不包含 API Key。"""
 
-    Returns:
-        {"model": "deepseek-chat", "base_url": "https://api.deepseek.com", ...}
-
-    实现思路：
-        逐项 os.getenv() 取配置，拼成 dict 返回，不包含 api_key
-    """
-    ...
+    load_dotenv()
+    return {
+        "model": os.getenv("LLM_MODEL", "deepseek-chat"),
+        "base_url": os.getenv("LLM_BASE_URL"),
+        "has_api_key": "true" if os.getenv("LLM_API_KEY") else "false",
+    }
