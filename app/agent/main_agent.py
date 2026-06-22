@@ -12,6 +12,7 @@ agent_node -> route -> tool_node -> agent_node -> ... -> END
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 from uuid import uuid4
 
@@ -19,11 +20,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.graph import END, StateGraph
 
 from app.agent.fork import ForkRequest, ForkResult, new_child_thread_id
+from app.agent.llm import get_llm
+from app.agent.prompts import get_system_prompt
 from app.agent.state import AgentState, create_initial_context
 from app.tools import (
     build_shopping_summary,
     compare_prices,
     filter_items,
+    get_langchain_tools,
     plan_task,
     search_items,
 )
@@ -37,9 +41,23 @@ class GlodexAgent:
     - `tools`：执行普通工具，或通过 `fork_agent` 创建子 AgentLoop。
     """
 
-    def __init__(self, *, system_prompt: str | None = None, max_rounds: int = 12) -> None:
-        self.system_prompt = system_prompt or "你是 Glodex Agent，负责电商选品与比价。"
+    def __init__(
+        self,
+        *,
+        system_prompt: str | None = None,
+        max_rounds: int = 12,
+        mode: str | None = None,
+        llm: Any | None = None,
+    ) -> None:
+        self.mode = mode or os.getenv("GLODEX_AGENT_MODE", "mock")
+        self.system_prompt = system_prompt or get_system_prompt()
         self.max_rounds = max_rounds
+        self.tools = get_langchain_tools()
+        self.llm = llm
+        self.llm_with_tools = None
+        if self.mode == "llm":
+            self.llm = self.llm or get_llm()
+            self.llm_with_tools = self.llm.bind_tools(self.tools)
         self._graph = None
 
     @property
@@ -81,8 +99,18 @@ class GlodexAgent:
                 "context": context,
             }
 
-        message = self._decide_next(state, context)
+        if self.mode == "llm":
+            message = self._invoke_llm(state)
+        else:
+            message = self._decide_next(state, context)
         return {"messages": [message], "context": context}
+
+    def _invoke_llm(self, state: AgentState) -> BaseMessage:
+        """调用真实 LLM，并让模型基于绑定工具产生 tool_calls。"""
+
+        if self.llm_with_tools is None:
+            raise RuntimeError("LLM 模式未初始化 llm_with_tools。")
+        return self.llm_with_tools.invoke(state["messages"])
 
     def _decide_next(self, state: AgentState, context: dict[str, Any]) -> AIMessage:
         """第一阶段确定性决策器。

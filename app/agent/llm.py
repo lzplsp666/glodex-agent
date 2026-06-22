@@ -1,48 +1,111 @@
-"""LLM 客户端工厂。
+"""独立的大模型配置读取与客户端工厂。
 
-第一阶段默认不依赖真实 LLM。这里保留标准工厂函数，方便后续切换到
-OpenAI 兼容接口时不改调用方。
+配置不写死在项目代码里，优先从环境变量读取。若需要把配置放在项目外，
+设置 `GLODEX_LLM_ENV_FILE` 指向任意 `.env` 文件即可。
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
 
+@dataclass(frozen=True)
+class LLMSettings:
+    """LLM 配置快照。"""
+
+    model: str
+    base_url: str | None
+    api_key: str | None
+    temperature: float
+    max_tokens: int | None
+
+    @property
+    def has_api_key(self) -> bool:
+        return bool(self.api_key)
+
+
+def load_llm_env() -> None:
+    """加载模型配置文件。
+
+    加载顺序：
+    1. `GLODEX_LLM_ENV_FILE` 指向的外部配置文件。
+    2. 当前工作目录下的 `.env`。
+
+    环境变量始终优先，`override=False` 不会覆盖已存在的系统环境变量。
+    """
+
+    external_env = os.getenv("GLODEX_LLM_ENV_FILE")
+    if external_env:
+        load_dotenv(Path(external_env), override=False)
+    load_dotenv(override=False)
+
+
+def get_llm_settings(
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> LLMSettings:
+    """读取 LLM 配置。"""
+
+    load_llm_env()
+    raw_temperature = os.getenv("LLM_TEMPERATURE", "0")
+    raw_max_tokens = os.getenv("LLM_MAX_TOKENS")
+    return LLMSettings(
+        model=model or os.getenv("LLM_MODEL", "deepseek-chat"),
+        base_url=base_url or os.getenv("LLM_BASE_URL"),
+        api_key=api_key or os.getenv("LLM_API_KEY"),
+        temperature=temperature if temperature is not None else float(raw_temperature),
+        max_tokens=max_tokens if max_tokens is not None else int(raw_max_tokens) if raw_max_tokens else None,
+    )
+
+
 def get_llm(
+    *,
     model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> Any:
-    """创建 LangChain ChatOpenAI 客户端。
+    """创建 OpenAI 兼容的 ChatOpenAI 客户端。"""
 
-    注意：第一阶段主 Agent 不调用这个函数，因此没有配置 API Key 也能运行。
-    真正需要 LLM 时再调用，缺依赖或缺 Key 的错误会在这里暴露。
-    """
-
-    load_dotenv()
     from langchain_openai import ChatOpenAI
 
-    return ChatOpenAI(
-        model=model or os.getenv("LLM_MODEL", "deepseek-chat"),
-        base_url=base_url or os.getenv("LLM_BASE_URL"),
-        api_key=api_key or os.getenv("LLM_API_KEY"),
-        temperature=0 if temperature is None else temperature,
+    settings = get_llm_settings(
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=temperature,
         max_tokens=max_tokens,
+    )
+    if not settings.api_key:
+        raise RuntimeError("缺少 LLM_API_KEY。请设置环境变量或 GLODEX_LLM_ENV_FILE。")
+
+    return ChatOpenAI(
+        model=settings.model,
+        base_url=settings.base_url,
+        api_key=settings.api_key,
+        temperature=settings.temperature,
+        max_tokens=settings.max_tokens,
     )
 
 
-def get_llm_info() -> dict[str, str | None]:
-    """返回当前 LLM 配置摘要，不包含 API Key。"""
+def get_llm_info() -> dict[str, str | bool | None]:
+    """返回当前 LLM 配置摘要，不泄露 API Key。"""
 
-    load_dotenv()
+    settings = get_llm_settings()
     return {
-        "model": os.getenv("LLM_MODEL", "deepseek-chat"),
-        "base_url": os.getenv("LLM_BASE_URL"),
-        "has_api_key": "true" if os.getenv("LLM_API_KEY") else "false",
+        "model": settings.model,
+        "base_url": settings.base_url,
+        "has_api_key": settings.has_api_key,
+        "temperature": str(settings.temperature),
+        "max_tokens": str(settings.max_tokens) if settings.max_tokens is not None else None,
     }

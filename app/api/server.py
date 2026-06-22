@@ -21,6 +21,7 @@ class TaskRequest(BaseModel):
 
     task: str = Field(..., min_length=1)
     thread_id: str | None = None
+    mode: str | None = Field(default=None, description="Agent 模式：mock 或 llm。")
 
 
 class TaskResponse(BaseModel):
@@ -46,7 +47,7 @@ def health() -> dict[str, str]:
 def create_task(request: TaskRequest) -> TaskResponse:
     """创建并同步执行一个第一阶段 Agent 任务。"""
 
-    agent = create_agent()
+    agent = create_agent(mode=request.mode)
     state = agent.run(request.task, thread_id=request.thread_id)
     thread_id = state["context"]["thread_id"]
     result = str(state["messages"][-1].content)
