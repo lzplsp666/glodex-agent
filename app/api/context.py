@@ -1,44 +1,69 @@
-"""任务上下文存储。
-
-第一阶段使用进程内字典保存任务结果。它足够用于本地演示和编译验证；
-后续接 Redis、数据库或文件输出目录时，可以替换这个类的实现。
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
-from app.api.monitor import AguiEvent
+# Current request task id, initialized at the API entry point.
+_thread_id_var: ContextVar[Optional[str]] = ContextVar(
+    "globex_thread_id", default=None
+)
 
-
-@dataclass
-class TaskRecord:
-    """一次 Agent 任务的快照。"""
-
-    thread_id: str
-    task: str
-    status: str
-    result: str
-    context: dict[str, Any] = field(default_factory=dict)
-    events: list[AguiEvent] = field(default_factory=list)
+# Current request session directory for files, reports, and logs.
+_session_dir_var: ContextVar[Optional[Path]] = ContextVar(
+    "globex_session_dir", default=None
+)
 
 
-class TaskStore:
-    """简单的内存任务表。"""
+@dataclass(frozen=True)
+class ThreadContextToken:
+    """Tokens used to restore a previous thread context."""
 
-    def __init__(self) -> None:
-        self._records: dict[str, TaskRecord] = {}
-
-    def save(self, record: TaskRecord) -> None:
-        """保存或覆盖任务记录。"""
-
-        self._records[record.thread_id] = record
-
-    def get(self, thread_id: str) -> TaskRecord | None:
-        """按 thread_id 查询任务记录。"""
-
-        return self._records.get(thread_id)
+    thread_id: Token[Optional[str]]
+    session_dir: Token[Optional[Path]]
 
 
-task_store = TaskStore()
+def set_thread_context(thread_id: str, session_dir: Path) -> None:
+    """Set the current request identity context at the API entry point."""
+    _thread_id_var.set(thread_id)
+    _session_dir_var.set(session_dir)
+
+
+def push_thread_context(thread_id: str, session_dir: Path) -> ThreadContextToken:
+    """
+    Temporarily override the current context and return reset tokens.
+
+    Use this before invoking a forked child AgentLoop when the child needs its
+    own thread_id while sharing the parent session directory.
+    """
+    return ThreadContextToken(
+        thread_id=_thread_id_var.set(thread_id),
+        session_dir=_session_dir_var.set(session_dir),
+    )
+
+
+def reset_thread_context(token: ThreadContextToken) -> None:
+    """Restore the context captured by push_thread_context."""
+    _session_dir_var.reset(token.session_dir)
+    _thread_id_var.reset(token.thread_id)
+
+
+def push_child_thread_context(sub_thread_id: str) -> ThreadContextToken:
+    """
+    Give a child AgentLoop an independent thread_id and the parent's session_dir.
+    """
+    parent_session_dir = get_session_dir()
+    if parent_session_dir is None:
+        raise RuntimeError("Cannot fork child AgentLoop without session_dir context.")
+    return push_thread_context(sub_thread_id, parent_session_dir)
+
+
+def get_thread_id() -> Optional[str]:
+    """Return the current coroutine's thread_id."""
+    return _thread_id_var.get()
+
+
+def get_session_dir() -> Optional[Path]:
+    """Return the current coroutine's session directory."""
+    return _session_dir_var.get()

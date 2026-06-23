@@ -1,8 +1,13 @@
+Yuxi-main/
+.env
+.env.local
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
 node_modules/
 dist/
 build/
-.env
-.env.local
 *.log
 .DS_Store
 Thumbs.db
