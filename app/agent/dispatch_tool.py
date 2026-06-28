@@ -1,35 +1,81 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+import asyncio
 from uuid import uuid4
 
-from app.api.context import push_child_thread_context, reset_thread_context
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+
+from app.agent.fork_guard import ForkLimitExceeded, enter_fork
+from app.agent.llm import get_llm
+from app.agent.middleware import truncate_long_tool_result
+from app.agent.prompts import get_system_prompt
+from app.api.context import get_session_dir, push_thread_context, reset_thread_context
+from app.api.monitor import monitor
 
 
-class AsyncSubAgent(Protocol):
-    """Minimal interface required from a forked child AgentLoop."""
-
-    async def ainvoke(self, demands: str) -> dict[str, Any]:
-        """Run the child AgentLoop and return its final state."""
-        ...
+SUB_AGENT_TIMEOUT_SEC = 90
+SUB_AGENT_MAX_ITERATIONS = 12
 
 
-async def dispatch_to_sub_agent(demands: str, sub_agent: AsyncSubAgent) -> str:
+@tool
+async def dispatch_tool(demands: str) -> str:
+    """派一个同质子 AgentLoop 去执行 demands，并返回它的最终回复。
+
+    适用条件（任一即可）：
+    1. 能并行：多个子任务可以同时跑。
+    2. 上下文要隔离：子任务输出很大，不应该污染主 loop。
+    3. 调用链 >= 3：子任务自己内部还要多轮 Think -> Act。
     """
-    Run a child AgentLoop with its own thread_id and the parent session_dir.
-
-    The parent context is always restored after the child finishes, so the
-    sub-thread id cannot leak back into the main AgentLoop.
-    """
-    sub_thread_id = f"sub-{uuid4().hex[:8]}"
-    token = push_child_thread_context(sub_thread_id)
+    # 延迟导入可以避免工具注册表和 dispatch_tool 之间形成循环 import。
+    from app.tools.tool_registry import FULL_TOOL_SET
 
     try:
-        result = await sub_agent.ainvoke(demands)
-        messages = result.get("messages") or []
-        if not messages:
-            return ""
-        last_message = messages[-1]
-        return str(getattr(last_message, "content", last_message))
-    finally:
-        reset_thread_context(token)
+        with enter_fork() as depth:
+            sub_thread_id = f"sub-{uuid4().hex[:8]}-d{depth}"
+            parent_session_dir = get_session_dir()
+            if parent_session_dir is None:
+                return "[dispatch_tool 拒绝] 当前没有 session_dir，无法派发子 AgentLoop。"
+
+            await monitor.report_fork(sub_thread_id, demands)
+
+            sub_agent = create_agent(
+                model=get_llm(),
+                tools=FULL_TOOL_SET,
+                system_prompt=get_system_prompt(),
+            )
+
+            token = push_thread_context(sub_thread_id, parent_session_dir)
+            try:
+                result = await asyncio.wait_for(
+                    sub_agent.ainvoke(
+                        {
+                            "messages": [
+                                {"role": "user", "content": demands},
+                            ],
+                        },
+                        config={
+                            "configurable": {
+                                "thread_id": sub_thread_id,
+                            },
+                            # 子 loop 迭代次数更小，避免子任务拖垮主任务。
+                            "recursion_limit": SUB_AGENT_MAX_ITERATIONS,
+                        },
+                    ),
+                    timeout=SUB_AGENT_TIMEOUT_SEC,
+                )
+            finally:
+                reset_thread_context(token)
+
+            messages = result.get("messages") or []
+            if not messages:
+                return ""
+
+            final_message = messages[-1]
+            content = getattr(final_message, "content", final_message)
+            return truncate_long_tool_result(str(content))
+    except ForkLimitExceeded as exc:
+        # 这里返回字符串，让主 loop 把子任务失败当作普通工具结果处理。
+        return f"[dispatch_tool 拒绝] {exc}。建议主 loop 自己处理或换一种拆分方式。"
+    except asyncio.TimeoutError:
+        return f"[dispatch_tool 超时] 子任务 {SUB_AGENT_TIMEOUT_SEC}s 未完成。建议缩小子任务范围。"

@@ -1,6 +1,8 @@
 # ItemSearch 工具设计
 
-`ItemSearch` 是 Glodex Agent 的第一个核心电商工具。它负责从国内电商平台搜索商品候选，并把不同平台返回的数据整理成统一结构，供主 AgentLoop 后续合流、比价、筛选和总结。
+`ItemSearch` 是 Glodex Agent 的第一个核心电商工具。它负责从已经构建好的国内商品库 / 商品索引中搜索候选商品，并把不同平台的数据整理成统一结构，供主 AgentLoop 后续合流、比价、筛选和总结。
+
+订单侠等开放平台 API 属于上游数据采集来源，负责把淘宝 / 天猫 / 京东 / 拼多多等平台商品拉回并填充商品库。`ItemSearch` 不负责入库，也不直接关心订单侠采集逻辑。
 
 ## 一、AgentLoop 链路
 
@@ -103,7 +105,7 @@ async def dispatch_tool(demands: str) -> str:
         _session_dir_var.reset(token_s)
 ```
 
-注意：`FULL_TOOL_SET` 里包含 `dispatch_tool` 自己，子 Agent 理论上也能再往下 fork。后续需要用 `max_depth` 防止 fork 链失控。
+注意：`FULL_TOOL_SET` 里包含 `dispatch_tool` 自己，子 Agent 理论上也能再往下 fork。当前通过 `app.agent.fork_guard` 中的 `fork_depth` 和 `MAX_FORK_DEPTH` 限制递归深度，防止 fork 链失控。完整方案见 `docs/14-AgentLoop防失控设计.md`。
 
 ### 什么时候不 fork
 
@@ -127,12 +129,12 @@ async def dispatch_tool(demands: str) -> str:
 
 `ItemSearch` 只负责一件事：
 
-**按指定国内平台搜索商品候选，并返回标准化商品列表。**
+**按指定国内平台从已有商品索引中搜索商品候选，并返回标准化商品列表。**
 
 它应该做：
 
 - 根据 `query` 搜商品。
-- 按 `platform` 调用对应平台数据源。
+- 按 `platform` 过滤已有商品索引。
 - 返回候选商品列表。
 - 标准化标题、价格、平台、链接、图片、店铺、销量、评分等字段。
 - 带回国内运费、包邮、配送时效等基础信息。
@@ -146,6 +148,8 @@ async def dispatch_tool(demands: str) -> str:
 - 不负责完整跨平台同款归并。
 
 国内场景先移除独立 `ShippingCalc`：没有跨境关税逻辑，普通运费、包邮、配送时效合并进 `ItemSearch` 的商品字段，以及后续 `PriceCompare` 的总价计算。
+
+当前第一版实现支持从 `ITEM_SEARCH_INDEX_PATH` 指向的 JSON / JSONL 商品索引中读取数据。后续接入 Milvus、Elasticsearch 或混合召回时，只需要替换底层搜索函数，不改变 Agent 工具接口。
 
 ## 四、国内平台来源
 
