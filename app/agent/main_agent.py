@@ -9,15 +9,18 @@ from app.agent.llm import get_llm
 from app.agent.prompts import get_system_prompt
 from app.api.context import set_thread_context
 from app.api.monitor import monitor
+from app.memory.extractor import (
+    extract_learned_preferences_from_result,
+    extract_memories,
+)
+from app.memory.injector import (
+    format_memories_for_prompt,
+    reset_memory_prompt,
+    set_memory_prompt,
+)
+from app.memory.store import store
 from app.tools.tool_registry import FULL_TOOL_SET
 from app.utils.path_utils import ensure_session_dir
-
-# TODO: 长期记忆 Store 完成后启用，用于读取用户偏好并写回新偏好。
-# from app.memory.store import store
-
-# TODO: 上下文压缩模块完成后启用，可通过 LangChain middleware 在模型调用前压缩历史消息。
-# from app.compress.breakpoint import compute_breakpoint
-# from app.compress.compressor import compress_messages
 
 
 MAIN_AGENT_MAX_ITERATIONS = 30
@@ -54,10 +57,10 @@ async def run_agent(
     session_dir = ensure_session_dir(thread_id)
     set_thread_context(thread_id, session_dir)
 
-    # TODO: 长期记忆 Store 完成后启用，从用户历史偏好中召回与 query 相关的内容。
-    # long_term = await store.read_relevant(user_id=user_id, query=query) if user_id else []
-    # pref_text = "\n".join(f"- {pref.text}" for pref in long_term) or "（暂无沉淀偏好）"
-    pref_text = "（暂无沉淀偏好）"
+    # 任务开始前先检索长期记忆，把相关偏好注入 system prompt。
+    long_term = await store.read_relevant(user_id=user_id, query=query) if user_id else []
+    pref_text = format_memories_for_prompt(long_term)
+    memory_token = set_memory_prompt(pref_text)
 
     system_prompt = get_system_prompt(long_term_preferences=pref_text)
     agent = _build_main_agent(system_prompt)
@@ -96,15 +99,32 @@ async def run_agent(
             "thread_id": thread_id,
             "error": str(exc),
         }
+    finally:
+        reset_memory_prompt(memory_token)
 
     final_text = _get_final_text(result)
 
-    # TODO: 长期记忆 Store 完成后启用，把模型沉淀出的新偏好写回 Store。
-    # final_msg = result["messages"][-1]
-    # if hasattr(final_msg, "additional_kwargs"):
-    #     new_prefs = final_msg.additional_kwargs.get("learned_preferences", [])
-    #     if user_id and new_prefs:
-    #         await store.write_many(user_id=user_id, texts=new_prefs)
+    # 任务结束后再沉淀长期记忆；写入失败不影响主任务结果。
+    if user_id:
+        learned_preferences = extract_learned_preferences_from_result(result)
+        try:
+            writes = await extract_memories(
+                user_query=query,
+                final_text=final_text,
+                learned_preferences=learned_preferences,
+            )
+            for write in writes:
+                await store.create(
+                    user_id=user_id,
+                    text=write.text,
+                    kind=write.kind,
+                    tags=write.tags,
+                    source_thread_id=thread_id,
+                    metadata=write.metadata,
+                    confidence=write.confidence,
+                )
+        except Exception as exc:
+            await monitor.report_error("memory_write_failed", str(exc))
 
     await monitor.report_task_result(final_text)
     return {

@@ -93,7 +93,7 @@ result = await agent.ainvoke(
 以下能力的接入代码已经在 `main_agent.py` 中用中文 TODO 注释预留，等对应模块实现后取消注释即可：
 
 - 长期记忆 Store：`app.memory.store.store`
-- 上下文压缩：`app.compress.breakpoint.compute_breakpoint` 和 `app.compress.compressor.compress_messages`
+- 上下文压缩：`app.memory.breakpoint.compute_breakpoint` 和 `app.memory.compressor.compress_messages`
 
 ## app.agent.dispatch_tool
 
