@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -11,6 +12,9 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from app.api.monitor import monitor
+from app.recall.ann import AnnUnavailable, ann_client
+from app.recall.tower_query import TowerUnavailable, query_tower_client
+from app.recall.tower_user import user_tower_client
 from app.tools.item_picker import CandidateItem
 
 
@@ -18,11 +22,7 @@ Platform = Literal[
     "all",
     "jd",
     "taobao",
-    "tmall",
     "pdd",
-    "1688",
-    "douyin",
-    "xiaohongshu",
     "mock",
 ]
 
@@ -69,13 +69,24 @@ async def item_search(
     )
     start = time.time()
 
-    # 订单侠等上游 API 负责采集和填充商品库；Agent 工具只负责查询已有索引。
-    # TODO: 后续把 _search_local_index 替换为 Milvus / Elasticsearch / 混合召回。
-    candidates, total_recall, notice = _search_local_index(
-        query=query,
-        platform=platform,
-        top_k=top_k,
-    )
+    backend = "local_index"
+    notice: str | None = None
+
+    try:
+        candidates, total_recall, notice = await _search_vector_index(
+            query=query,
+            platform=platform,
+            top_k=top_k,
+            user_id=user_id,
+        )
+        backend = "vector_ann"
+    except Exception as exc:
+        candidates, total_recall, local_notice = _search_local_index(
+            query=query,
+            platform=platform,
+            top_k=top_k,
+        )
+        notice = local_notice or f"向量召回不可用，已回退本地索引：{exc}"
 
     await monitor.report_tool_end("item_search", int((time.time() - start) * 1000))
     return ItemSearchOutput(
@@ -84,8 +95,108 @@ async def item_search(
         candidates=candidates,
         total_recall=total_recall,
         truncated=total_recall > len(candidates),
+        backend=backend,
         notice=notice,
     )
+
+
+async def _search_vector_index(
+    query: str,
+    platform: str,
+    top_k: int,
+    user_id: str | None,
+) -> tuple[list[CandidateItem], int, str | None]:
+    """Run semantic and optional personalized ANN recall."""
+    if not ann_client.is_configured():
+        raise AnnUnavailable("ANN backend is not configured")
+    if not query_tower_client.is_configured():
+        raise TowerUnavailable("TOWER_QUERY_ENDPOINT is not configured")
+
+    query_emb = await query_tower_client.encode_query(query)
+    semantic_task = asyncio.create_task(
+        asyncio.to_thread(ann_client.search, query_emb, top_k, platform)
+    )
+
+    personalized_task: asyncio.Task[list[dict[str, Any]]] | None = None
+    if user_id and user_tower_client.is_configured():
+        personalized_task = asyncio.create_task(
+            _personalized_recall(
+                query_emb=query_emb,
+                platform=platform,
+                top_k=top_k,
+                user_id=user_id,
+            )
+        )
+
+    semantic = await semantic_task
+    personalized = await personalized_task if personalized_task else []
+    merged = _dedupe_and_rerank(semantic, personalized)
+    candidates = [_to_candidate_item(row) for row in merged[:top_k]]
+    total_recall = len(semantic) + len(personalized)
+
+    notice = None
+    if user_id and personalized_task is None:
+        notice = "未配置 TOWER_USER_ENDPOINT，本次只使用语义召回。"
+    return candidates, total_recall, notice
+
+
+async def _personalized_recall(
+    query_emb: list[float],
+    platform: str,
+    top_k: int,
+    user_id: str,
+) -> list[dict[str, Any]]:
+    user_emb = await user_tower_client.encode_user(user_id)
+    fused = _fuse_embeddings(user_emb=user_emb, query_emb=query_emb)
+    return await asyncio.to_thread(ann_client.search, fused, top_k, platform)
+
+
+def _fuse_embeddings(user_emb: list[float], query_emb: list[float]) -> list[float]:
+    """Fuse user and query embeddings for the personalized channel."""
+    if len(user_emb) != len(query_emb):
+        return query_emb
+    return [
+        0.6 * user_value + 0.4 * query_value
+        for user_value, query_value in zip(user_emb, query_emb)
+    ]
+
+
+def _dedupe_and_rerank(
+    semantic: list[dict[str, Any]],
+    personalized: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge two recall channels by item_id and boost duplicated hits."""
+    bag: dict[str, dict[str, Any]] = {}
+
+    for row in semantic:
+        item_id = _row_item_id(row)
+        if not item_id:
+            continue
+        bag[item_id] = {**row, "boost": _score_value(row)}
+
+    for row in personalized:
+        item_id = _row_item_id(row)
+        if not item_id:
+            continue
+        existing = bag.get(item_id)
+        if existing:
+            existing["boost"] = _score_value(existing) + 0.5 * _score_value(row)
+            continue
+        bag[item_id] = {**row, "boost": 0.8 * _score_value(row)}
+
+    return sorted(bag.values(), key=lambda item: float(item.get("boost") or 0.0), reverse=True)
+
+
+def _row_item_id(row: dict[str, Any]) -> str:
+    return str(row.get("item_id") or row.get("id") or row.get("goods_id") or row.get("goodsId") or "")
+
+
+def _score_value(row: dict[str, Any]) -> float:
+    for key in ("boost", "score", "distance"):
+        value = _to_float(row.get(key))
+        if value is not None:
+            return value
+    return 0.0
 
 
 def _search_local_index(
@@ -158,26 +269,22 @@ def _load_local_products() -> list[dict[str, Any]]:
 def _to_candidate_item(product: dict[str, Any]) -> CandidateItem:
     """把商品库中的 dict 兼容转换为 CandidateItem。"""
     return CandidateItem(
-        item_id=str(product.get("item_id") or product.get("id") or product.get("goods_id")),
+        item_id=str(product.get("item_id") or product.get("id") or product.get("goods_id") or product.get("goodsId")),
         platform=str(product.get("platform") or "unknown"),
         title=str(product.get("title") or product.get("name") or ""),
-        price_cny=_to_float(product.get("price_cny") or product.get("price")),
-        shipping_fee_cny=_to_float(product.get("shipping_fee_cny")),
-        free_shipping=_to_bool_or_none(product.get("free_shipping")),
-        eta_days=_to_int_or_none(product.get("eta_days")),
-        shop_name=_to_str_or_none(product.get("shop_name")),
-        shop_type=_to_str_or_none(product.get("shop_type")),
-        rating=_to_float(product.get("rating")),
-        sales=_to_int_or_none(product.get("sales")),
-        image_url=_to_str_or_none(product.get("image_url")),
+        price_cny=_to_float(product.get("price_cny") or product.get("originalPrice") or product.get("price")),
+        coupon_cny=_to_float(product.get("coupon_cny") or product.get("couponPrice")),
+        final_price_cny=_to_float(product.get("final_price_cny") or product.get("actualPrice")),
+        shop_name=_to_str_or_none(product.get("shop_name") or product.get("shopName")),
+        sales=_to_int_or_none(product.get("sales") or product.get("monthSales")),
+        image_url=_to_str_or_none(product.get("image_url") or product.get("picUrl")),
         url=_to_str_or_none(product.get("url")),
-        attributes=_to_dict(product.get("attributes")),
-        tags=_to_str_list(product.get("tags")),
+        attributes=_to_dict(product.get("attributes") or product.get("attributes_json")),
     )
 
 
 def _keyword_score(query: str, candidate: CandidateItem) -> float:
-    """临时关键词打分；后续向量召回接入后会替换掉。"""
+    """临时关键词打分；向量召回接入后会替换掉。"""
     query_terms = _split_terms(query)
     if not query_terms:
         return 0.0
@@ -185,11 +292,8 @@ def _keyword_score(query: str, candidate: CandidateItem) -> float:
     searchable_text = " ".join(
         [
             candidate.title,
-            candidate.platform,
             candidate.shop_name or "",
-            candidate.shop_type or "",
-            " ".join(candidate.tags),
-            " ".join(str(value) for value in candidate.attributes.values()),
+            *_attr_text_parts(candidate.attributes),
         ]
     ).lower()
 
@@ -199,13 +303,21 @@ def _keyword_score(query: str, candidate: CandidateItem) -> float:
             score += 1.0
     if candidate.sales:
         score += min(candidate.sales / 10000, 0.2)
-    if candidate.rating:
-        score += max(candidate.rating - 4.0, 0) * 0.1
     return score
 
 
 def _split_terms(query: str) -> list[str]:
     return [term.lower() for term in query.replace("，", " ").replace(",", " ").split() if term]
+
+
+def _attr_text_parts(attributes: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
+    for key, value in attributes.items():
+        if value in (None, ""):
+            continue
+        parts.append(str(value))
+        parts.append(f"{key}:{value}")
+    return parts
 
 
 def _to_float(value: Any) -> float | None:
@@ -226,20 +338,6 @@ def _to_int_or_none(value: Any) -> int | None:
         return None
 
 
-def _to_bool_or_none(value: Any) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if value is None or value == "":
-        return None
-    if isinstance(value, str):
-        lowered = value.lower()
-        if lowered in {"true", "1", "yes", "包邮"}:
-            return True
-        if lowered in {"false", "0", "no", "不包邮"}:
-            return False
-    return None
-
-
 def _to_str_or_none(value: Any) -> str | None:
     if value is None or value == "":
         return None
@@ -247,12 +345,12 @@ def _to_str_or_none(value: Any) -> str | None:
 
 
 def _to_dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _to_str_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item) for item in value]
-    if isinstance(value, str) and value:
-        return [value]
-    return []
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+    return {}

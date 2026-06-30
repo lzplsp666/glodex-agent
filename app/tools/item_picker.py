@@ -13,24 +13,20 @@ from app.api.monitor import monitor
 class CandidateItem(BaseModel):
     """国内电商候选商品。
 
-    国内平台字段经常不完整，所以除 item_id / platform / title 外都尽量做成可选。
+    字段精简为 API 真实可获取的 11 个字段 + attributes 多模态提取。
     """
 
     item_id: str
     platform: str
     title: str
     price_cny: float | None = None
-    shipping_fee_cny: float | None = None
-    free_shipping: bool | None = None
-    eta_days: int | None = None
+    coupon_cny: float | None = None
+    final_price_cny: float | None = None
     shop_name: str | None = None
-    shop_type: str | None = None
-    rating: float | None = None
     sales: int | None = None
     image_url: str | None = None
     url: str | None = None
     attributes: dict[str, Any] = Field(default_factory=dict)
-    tags: list[str] = Field(default_factory=list)
 
 
 class PickedItem(BaseModel):
@@ -63,9 +59,9 @@ async def item_picker(
     """从国内电商候选商品中精选 1-3 件最适合用户的商品。
 
     Args:
-        candidates: 已经由 ItemSearch / PriceCompare 标准化后的候选商品。
+        candidates: 已经由 ItemSearch 标准化后的候选商品。
         insight: 可选品类洞察，例如合理价格区间、避坑材质、推荐标签等。
-        user_preferences: 用户本轮或长期偏好，例如“不要塑料”“必须包邮”“偏好小众”。
+        user_preferences: 用户本轮或长期偏好，例如"不要塑料""偏好小众""白色"。
         top_n: 最多返回的精选商品数量，默认 3。
         max_budget_cny: 可选预算上限，超过预算的商品会被硬性排除。
 
@@ -140,34 +136,22 @@ def _check_hard_constraints(
     pref_text = _join_text(preferences)
     item_text = _item_search_text(item)
 
+    # ── 预算硬约束 ──
     if max_budget_cny is not None and item.price_cny is not None:
         if item.price_cny > max_budget_cny:
             return f"价格 {item.price_cny} 元超过预算 {max_budget_cny} 元", flags
 
+    # ── 材质约束（从 attributes 或标题判断） ──
     if "不要塑料" in pref_text or "非塑料" in pref_text:
         if _contains_any(item_text, ["塑料", "pp", "pe", "abs", "pvc"]):
             return "命中用户硬约束：不要塑料", flags
         if not item.attributes:
-            flags.append("材质未知，需二次确认")
+            flags.append("材质信息未知，需二次确认")
 
-    if "必须包邮" in pref_text or "只要包邮" in pref_text:
-        if item.free_shipping is False:
-            return "不满足必须包邮", flags
-        if item.shipping_fee_cny is not None and item.shipping_fee_cny > 0:
-            return "存在运费，不满足必须包邮", flags
-        if item.free_shipping is None and item.shipping_fee_cny is None:
-            flags.append("包邮信息未知")
-
+    # ── 预售约束 ──
     if "不要预售" in pref_text or "现货" in pref_text:
         if _contains_any(item_text, ["预售", "预定", "定金", "尾款"]):
             return "命中用户硬约束：不要预售", flags
-
-    if "只要自营" in pref_text or "京东自营" in pref_text:
-        shop_type = (item.shop_type or "").lower()
-        if item.shop_type and "自营" not in shop_type:
-            return "不满足自营店铺要求", flags
-        if not item.shop_type:
-            flags.append("店铺类型未知")
 
     return None, flags
 
@@ -178,13 +162,18 @@ def _score_item(
     preferences: list[str],
     max_budget_cny: float | None,
 ) -> tuple[float, list[str], list[str]]:
-    """按国内电商常见维度做轻量综合打分。"""
+    """按国内电商常见维度做轻量综合打分。
+
+    只依赖实际可获取的字段：价格、销量、attributes、标题。
+    """
     score = 0.0
     reasons: list[str] = []
     flags: list[str] = []
     pref_text = _join_text(preferences)
     item_text = _item_search_text(item)
+    attr_text = _join_text(_attr_values(item))
 
+    # ── 价格评分 ──
     price_score, price_reason, price_flag = _score_price(item, insight, max_budget_cny)
     score += price_score
     if price_reason:
@@ -192,72 +181,69 @@ def _score_item(
     if price_flag:
         flags.append(price_flag)
 
-    if item.free_shipping is True:
-        score += 0.15
-        reasons.append("包邮")
-    elif item.shipping_fee_cny is not None and item.shipping_fee_cny <= 5:
-        score += 0.05
-        reasons.append("运费较低")
+    # ── 券后价优势（有券 = 更划算） ──
+    if item.coupon_cny is not None and item.coupon_cny > 0:
+        score += 0.12
+        reasons.append(f"可领 {int(item.coupon_cny)} 元优惠券")
+    if item.final_price_cny is not None and item.price_cny is not None:
+        if item.final_price_cny < item.price_cny * 0.8:
+            score += 0.10
+            reasons.append("券后价有明显优势")
 
-    if item.eta_days is not None:
-        if item.eta_days <= 2:
-            score += 0.15
-            reasons.append(f"{item.eta_days} 天内送达")
-        elif item.eta_days <= 5:
-            score += 0.08
-            reasons.append("配送时效尚可")
-
-    if item.rating is not None:
-        if item.rating >= 4.8:
-            score += 0.2
-            reasons.append("评分较高")
-        elif item.rating >= 4.5:
-            score += 0.12
-            reasons.append("评分稳定")
-        elif item.rating < 4.0:
-            flags.append("评分偏低")
-
+    # ── 销量评分 ──
     if item.sales is not None:
         if "小众" in pref_text and item.sales > 10000:
             flags.append("销量很高，可能偏爆款")
         elif item.sales >= 10000:
-            score += 0.12
+            score += 0.15
             reasons.append("销量高")
         elif item.sales >= 1000:
-            score += 0.08
+            score += 0.10
             reasons.append("有一定销量基础")
         elif item.sales < 20:
-            flags.append("销量较少")
+            flags.append("销量较少，需关注")
 
-    shop_text = _join_text([item.shop_name or "", item.shop_type or ""])
-    if _contains_any(shop_text, ["自营", "旗舰店", "官方", "品牌店"]):
-        score += 0.18
+    # ── 店铺评分（从 shop_name 推测，不再依赖 shop_type） ──
+    shop_lower = (item.shop_name or "").lower()
+    if _contains_any(shop_lower, ["自营", "旗舰", "官方"]):
+        score += 0.15
         reasons.append("店铺可信度较高")
+    elif _contains_any(shop_lower, ["专卖", "专营", "品牌"]):
+        score += 0.08
+        reasons.append("品牌授权店铺")
 
-    if _contains_any(pref_text, ["小众", "不网红"]) and not (
-        item.sales is not None and item.sales > 10000
-    ):
-        score += 0.1
-        reasons.append("更接近小众偏好")
+    # ── attributes 匹配用户偏好 ──
+    # 颜色偏好
+    for color_pref in ["白色", "黑色", "灰色", "蓝色", "红色", "粉色", "绿色", "银色"]:
+        if color_pref in pref_text and color_pref in attr_text:
+            score += 0.10
+            reasons.append(f"颜色匹配偏好：{color_pref}")
+            break
 
-    if "简约" in pref_text and _contains_any(item_text, ["简约", "极简", "素色"]):
-        score += 0.1
+    # 材质偏好
+    if "不要塑料" in pref_text or "非塑料" in pref_text:
+        if not _contains_any(attr_text, ["塑料", "pp", "pe"]):
+            score += 0.08
+            reasons.append("材质符合非塑料偏好")
+
+    # 简约风格
+    if "简约" in pref_text and _contains_any(item_text, ["简约", "极简", "素色", "纯色"]):
+        score += 0.08
         reasons.append("风格匹配简约偏好")
 
-    if "耐用" in pref_text and _contains_any(item_text, ["耐用", "加厚", "高强度"]):
-        score += 0.1
+    # 耐用偏好
+    if "耐用" in pref_text and _contains_any(item_text, ["耐用", "加厚", "高强度", "加固"]):
+        score += 0.08
         reasons.append("耐用性描述匹配")
 
+    # ── insight 推荐/避坑（从 attributes 匹配） ──
     avoid_keywords = insight.get("avoid_keywords") or insight.get("avoid_tags") or []
-    if avoid_keywords and _contains_any(item_text, [str(word) for word in avoid_keywords]):
+    if avoid_keywords and _contains_any(attr_text, [str(w) for w in avoid_keywords]):
         flags.append("命中品类避坑关键词")
         score -= 0.15
 
     recommend_keywords = insight.get("recommend_keywords") or insight.get("recommend_tags") or []
-    if recommend_keywords and _contains_any(
-        item_text,
-        [str(word) for word in recommend_keywords],
-    ):
+    if recommend_keywords and _contains_any(attr_text, [str(w) for w in recommend_keywords]):
         score += 0.12
         reasons.append("匹配品类推荐特征")
 
@@ -313,9 +299,19 @@ def _extract_price_range(insight: dict[str, Any]) -> tuple[float, float] | None:
 
 
 def _item_search_text(item: CandidateItem) -> str:
-    """把标题、属性和标签拼成检索文本，便于做轻量规则判断。"""
-    attr_values = [str(value) for value in item.attributes.values()]
-    return _join_text([item.title, item.platform, *item.tags, *attr_values])
+    """把标题和 attributes 拼成检索文本，便于做轻量规则判断。"""
+    return _join_text([item.title, *_attr_values(item)])
+
+
+def _attr_values(item: CandidateItem) -> list[str]:
+    """提取 attributes 的 key/value，扁平化为可检索文本。"""
+    parts: list[str] = []
+    for key, value in item.attributes.items():
+        if value in (None, ""):
+            continue
+        parts.append(str(value))
+        parts.append(f"{key}:{value}")
+    return parts
 
 
 def _join_text(parts: list[str]) -> str:
