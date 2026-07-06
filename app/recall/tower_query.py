@@ -9,24 +9,42 @@ class TowerUnavailable(RuntimeError):
 
 
 class QueryTowerClient:
-    """HTTP client for query embedding service."""
+    """HTTP client for query embedding service.
+
+    If no dedicated tower endpoint is configured, it falls back to the same
+    OpenAI-compatible embedding client used by ingestion. This keeps Milvus
+    product vectors and query vectors in the same vector space.
+    """
 
     def __init__(self) -> None:
+        try:
+            from app.ingest.env import load_dotenv
+
+            load_dotenv()
+        except Exception:
+            pass
         self.endpoint = os.environ.get("TOWER_QUERY_ENDPOINT")
         self.timeout = float(os.environ.get("TOWER_TIMEOUT_SEC", "5.0"))
 
     def is_configured(self) -> bool:
-        return bool(self.endpoint)
+        if self.endpoint:
+            return True
+        return bool(os.environ.get("EMBEDDING_API_KEY") or os.environ.get("OPENAI_API_KEY"))
 
     async def encode_query(self, query: str) -> list[float]:
         if not self.endpoint:
-            raise TowerUnavailable("TOWER_QUERY_ENDPOINT is not configured")
-        payload = await _post_embedding(
-            endpoint=self.endpoint,
-            body={"query": query},
-            timeout=self.timeout,
-        )
-        return _parse_embedding(payload)
+            return await _embed_with_ingest_client(query)
+        try:
+            payload = await _post_embedding(
+                endpoint=self.endpoint,
+                body={"query": query},
+                timeout=self.timeout,
+            )
+            return _parse_embedding(payload)
+        except Exception:
+            if os.environ.get("EMBEDDING_API_KEY") or os.environ.get("OPENAI_API_KEY"):
+                return await _embed_with_ingest_client(query)
+            raise
 
 
 async def _post_embedding(
@@ -56,6 +74,18 @@ def _parse_embedding(payload: dict[str, Any]) -> list[float]:
         return [float(value) for value in embedding]
     except (TypeError, ValueError) as exc:
         raise TowerUnavailable("tower embedding contains non-numeric values") from exc
+
+
+async def _embed_with_ingest_client(query: str) -> list[float]:
+    try:
+        from app.ingest.embedding import EmbeddingClient
+    except ImportError as exc:
+        raise TowerUnavailable("embedding client is not available") from exc
+
+    try:
+        return await EmbeddingClient().embed(query)
+    except Exception as exc:
+        raise TowerUnavailable("embedding fallback failed") from exc
 
 
 query_tower_client = QueryTowerClient()

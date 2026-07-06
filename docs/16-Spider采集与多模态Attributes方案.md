@@ -10,7 +10,7 @@
 spider search
   -> 商品固定字段 + 主图
 spider detail
-  -> 购买链接 + banner 多图 + 类目/tag/shop/detail raw
+  -> 购买链接 + banner 多图 + 类目/tag/shop
 多模态模型
   -> 根据 title + shopName + category + image_urls 生成 attributes
 normalizer
@@ -18,7 +18,7 @@ normalizer
 writer / milvus writer
   -> 写入本地 JSONL 或 Milvus
 ItemSearch
-  -> embedding_text = title + shop_name + attributes(key:value)
+  -> title 关键词检索 + embedding 向量检索
 ItemPicker
   -> attributes 辅助硬约束、偏好打分和推荐解释
 ```
@@ -38,7 +38,7 @@ ItemPicker
 | `originalPrice` | 原价 | 是，映射 `price_cny` |
 | `actualPrice` | 券后价 / 当前到手价 | 是，映射 `final_price_cny` |
 | `couponPrice` | 优惠券金额 | 是，映射 `coupon_cny` |
-| `commission` | 佣金 | 可进 `raw`，暂不作为核心字段 |
+| `commission` | 佣金 | 不入库，当前不作为核心字段 |
 | `monthSales` | 月销量 | 是，映射 `sales` |
 | `picUrl` | 主图 | 是，映射 `image_url` |
 
@@ -51,7 +51,7 @@ ItemPicker
 | `购买链接` | 转链后的购买 URL | 映射 `url` |
 | `商品详情.picUrl` | 主图 | 多模态输入 + `image_url` |
 | `商品详情.goodsBannerList` | 多张商品 banner 图 | 多模态输入 |
-| `商品详情.tagList` | 平台标签，如京东物流、7天无理由 | 生成 `attributes` 或进 `raw` |
+| `商品详情.tagList` | 平台标签，如京东物流、7天无理由 | 生成 `attributes` |
 | `商品详情.levelOneCategoryName` | 一级类目 | 生成 `attributes.category` |
 | `商品详情.shopName` | 店铺名 | 固定字段 + 多模态上下文 |
 | `商品详情.originalPrice/actualPrice/couponPrice` | 价格字段 | 固定字段 |
@@ -74,7 +74,6 @@ class NormalizedProduct(BaseModel):
     image_url: str | None = None
     url: str | None = None
     attributes: dict[str, Any] = Field(default_factory=dict)
-    raw: dict[str, Any] = Field(default_factory=dict)
 ```
 
 麦手搜索和详情接口已经能覆盖这些固定字段。`attributes` 不要求固定 schema，因此很适合由多模态模型从标题和图片中补充。
@@ -100,7 +99,13 @@ class NormalizedProduct(BaseModel):
 title + shop_name + attributes(key:value)
 ```
 
-因此 `attributes` 不只是展示字段，也会影响 Milvus 向量召回和本地关键词回退。
+因此 `attributes` 不只是展示字段，也会影响 embedding 向量召回和本地关键词回退。
+
+同时，`title` 会作为独立字段保留，用于关键词检索。最终检索采用混合方式：
+
+```text
+title 关键词检索 + embedding 向量检索 -> 按 item_id 去重合并 -> 双路命中加权
+```
 
 ## 推荐的数据流
 
@@ -118,10 +123,10 @@ source = 1 / 2 / 3
 输出：
 
 ```text
-list[raw_search_item]
+list[maishou_search_item]
 ```
 
-保留搜索结果里的固定字段和 `raw`。
+保留搜索结果里的固定字段，不保存完整原始返回。
 
 ### 2. 详情补全阶段
 
@@ -211,12 +216,39 @@ format_detail_yaml(detail) -> str
 | `sales` | `monthSales` / `salesStr` |
 | `image_url` | `picUrl` |
 | `url` | 转链接口返回的购买链接 |
-| `attributes` | 多模态模型生成 |
-| `raw` | search raw + detail raw |
+| `attributes_json` | 多模态模型生成的动态属性 |
 | `embedding_text` | `title + shop_name + attributes(key:value)` |
 | `embedding` | 由 `embedding_text` 生成的向量 |
 
-Milvus 中可以把 `attributes` 存成 `attributes_json`，同时把 `brand` / `category` / `material` / `color` 等高频属性后续拆成标量字段，用于过滤和重排。
+不保存 `raw` 原始返回。麦手 search/detail 的完整响应只在调试日志或临时文件中保留，正式入库只保留上表字段。
+
+Milvus 中把 `attributes` 存成 `attributes_json`，同时把 `brand` / `category` / `material` / `color` 等高频属性后续拆成标量字段，用于过滤和重排。
+
+## 混合检索策略
+
+入库时同时保存 `title` 和 `embedding`：
+
+| 字段 | 中文名 | 用途 |
+|---|---|---|
+| `title` | 商品标题 | 关键词检索，适合匹配 DDR5、16G、白色、品牌名等精确词 |
+| `embedding_text` | 向量化文本 | 生成商品向量的原文，方便排查 |
+| `embedding` | 商品向量 | Milvus ANN 语义召回 |
+
+查询时走两路：
+
+```text
+1. title 关键词检索
+   query 与 title 做 contains / 后续 BM25 匹配
+
+2. embedding 向量检索
+   query -> query_embedding -> Milvus ANN
+
+3. 合并重排
+   item_id 去重
+   title 和 embedding 双路命中的商品加分
+```
+
+第一版可以先实现 `title contains + embedding ANN`，后续再升级到 Milvus sparse/BM25。
 
 ## 注意点
 

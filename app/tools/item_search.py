@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -106,7 +107,7 @@ async def _search_vector_index(
     top_k: int,
     user_id: str | None,
 ) -> tuple[list[CandidateItem], int, str | None]:
-    """Run semantic and optional personalized ANN recall."""
+    """Run title + embedding hybrid recall and optional personalized recall."""
     if not ann_client.is_configured():
         raise AnnUnavailable("ANN backend is not configured")
     if not query_tower_client.is_configured():
@@ -114,7 +115,7 @@ async def _search_vector_index(
 
     query_emb = await query_tower_client.encode_query(query)
     semantic_task = asyncio.create_task(
-        asyncio.to_thread(ann_client.search, query_emb, top_k, platform)
+        asyncio.to_thread(ann_client.hybrid_search, query, query_emb, top_k, platform)
     )
 
     personalized_task: asyncio.Task[list[dict[str, Any]]] | None = None
@@ -130,7 +131,13 @@ async def _search_vector_index(
 
     semantic = await semantic_task
     personalized = await personalized_task if personalized_task else []
-    merged = _dedupe_and_rerank(semantic, personalized)
+    merged = ann_client.merge_results(
+        primary=semantic,
+        secondary=personalized,
+        primary_weight=1.0,
+        secondary_weight=0.8,
+        duplicate_boost=0.5,
+    )
     candidates = [_to_candidate_item(row) for row in merged[:top_k]]
     total_recall = len(semantic) + len(personalized)
 
@@ -148,7 +155,8 @@ async def _personalized_recall(
 ) -> list[dict[str, Any]]:
     user_emb = await user_tower_client.encode_user(user_id)
     fused = _fuse_embeddings(user_emb=user_emb, query_emb=query_emb)
-    return await asyncio.to_thread(ann_client.search, fused, top_k, platform)
+    rows = await asyncio.to_thread(ann_client.search, fused, top_k, platform)
+    return [{**row, "recall_channels": ["personalized_embedding"]} for row in rows]
 
 
 def _fuse_embeddings(user_emb: list[float], query_emb: list[float]) -> list[float]:
@@ -159,44 +167,6 @@ def _fuse_embeddings(user_emb: list[float], query_emb: list[float]) -> list[floa
         0.6 * user_value + 0.4 * query_value
         for user_value, query_value in zip(user_emb, query_emb)
     ]
-
-
-def _dedupe_and_rerank(
-    semantic: list[dict[str, Any]],
-    personalized: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Merge two recall channels by item_id and boost duplicated hits."""
-    bag: dict[str, dict[str, Any]] = {}
-
-    for row in semantic:
-        item_id = _row_item_id(row)
-        if not item_id:
-            continue
-        bag[item_id] = {**row, "boost": _score_value(row)}
-
-    for row in personalized:
-        item_id = _row_item_id(row)
-        if not item_id:
-            continue
-        existing = bag.get(item_id)
-        if existing:
-            existing["boost"] = _score_value(existing) + 0.5 * _score_value(row)
-            continue
-        bag[item_id] = {**row, "boost": 0.8 * _score_value(row)}
-
-    return sorted(bag.values(), key=lambda item: float(item.get("boost") or 0.0), reverse=True)
-
-
-def _row_item_id(row: dict[str, Any]) -> str:
-    return str(row.get("item_id") or row.get("id") or row.get("goods_id") or row.get("goodsId") or "")
-
-
-def _score_value(row: dict[str, Any]) -> float:
-    for key in ("boost", "score", "distance"):
-        value = _to_float(row.get(key))
-        if value is not None:
-            return value
-    return 0.0
 
 
 def _search_local_index(
@@ -307,7 +277,22 @@ def _keyword_score(query: str, candidate: CandidateItem) -> float:
 
 
 def _split_terms(query: str) -> list[str]:
-    return [term.lower() for term in query.replace("，", " ").replace(",", " ").split() if term]
+    terms: list[str] = []
+    for token in re.split(r"[\s,，;；]+", query.lower()):
+        token = token.strip()
+        if not token:
+            continue
+        terms.append(token)
+        if re.search(r"[\u4e00-\u9fff]", token) and len(token) > 2:
+            for size in (2, 3):
+                for idx in range(0, max(len(token) - size + 1, 0)):
+                    terms.append(token[idx : idx + size])
+
+    deduped: list[str] = []
+    for term in terms:
+        if term not in deduped:
+            deduped.append(term)
+    return deduped[:12]
 
 
 def _attr_text_parts(attributes: dict[str, Any]) -> list[str]:
