@@ -1,13 +1,13 @@
-"""L1 Cache Breakpoint：计算稳定区和可压缩区的分界线。
+"""L1 Cache Breakpoint：计算可压缩历史区和近期保护区的分界线。
 
 这是工程概念，不是 Anthropic 的 cache_control API 参数。
 
 核心思想：
   把上下文分成两部分——
-  - Breakpoint 之前（稳定区）：不压缩，尽量保持内容不变，方便服务端 prefix cache 命中。
-  - Breakpoint 之后（可压缩区）：允许截断、摘要或滑窗。
+  - Breakpoint 之前（历史区）：允许截断、摘要或滑窗。
+  - Breakpoint 之后（近期保护区）：保留最近工具结果和当前任务上下文。
 
-稳定区默认保留：
+压缩时默认保护：
   1. system prompt。
   2. 最近 K 次工具调用和工具结果。
   3. 当前用户消息。
@@ -23,17 +23,19 @@ def compute_breakpoint(messages: list[Any], keep_recent_tool_calls: int = 3) -> 
     """计算 Cache Breakpoint 分界索引。
 
     规则：找到倒数第 keep_recent_tool_calls 个 tool/function 消息的位置，
-    该位置之前的内容属于可压缩区。
+    该位置之前的内容属于可压缩历史区，该位置之后属于近期保护区。
 
-    如果工具调用数 ≤ keep_recent_tool_calls，则不压缩，返回 len(messages)。
+    如果工具调用数 ≤ keep_recent_tool_calls，则没有明确旧工具历史可压缩，
+    返回 len(messages)，由 compressor 走 fallback 策略。
 
     Args:
         messages: 当前对话的完整消息列表。
         keep_recent_tool_calls: 保留最近几次工具调用，默认 3。
 
     Returns:
-        分界索引，messages[:breakpoint] 是稳定区，messages[breakpoint:] 是可压缩区。
-        返回 len(messages) 表示无需压缩。
+        分界索引，messages[:breakpoint] 是可压缩历史区，
+        messages[breakpoint:] 是近期保护区。返回 len(messages) 表示没有
+        足够旧工具历史可供按工具调用切分。
     """
     tool_indices = [
         index
@@ -48,7 +50,7 @@ def compute_breakpoint(messages: list[Any], keep_recent_tool_calls: int = 3) -> 
 
 
 def is_cache_point(message: Any, index: int, total: int, recent_user_count: int = 3) -> bool:
-    """判断某条消息是否属于稳定区，不应参与压缩。
+    """判断某条消息是否属于保护点，不应参与内容截断。
 
     满足任一条件即为 cache point：
     1. role 为 system（保护 system prompt）。

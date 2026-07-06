@@ -1,7 +1,7 @@
-"""L2 上下文压缩：对 breakpoint 之后的可压缩区执行截断、滑窗、摘要。
+"""L2 上下文压缩：对 breakpoint 之前的旧历史区执行截断、滑窗、摘要。
 
 压缩策略（三级递进）：
-  1. tool_trim：对可压缩区中的 tool/function 消息做字符截断。
+  1. tool_trim：对旧历史区中的 tool/function 消息做字符截断。
   2. sliding_window：如果 tool_trim 后仍超阈值，保留最近的消息 + 所有 system 消息。
   3. summary：第一版暂不启用（不调 LLM 做摘要），后续接入。
 
@@ -9,7 +9,7 @@
 
 设计原则：
   - 只在 token 估算超阈值时才触发，不压缩时不改消息列表。
-  - 逐消息处理，不修改 cache point 消息。
+  - 逐消息处理，不修改 cache point 和近期保护区消息。
   - 压缩失败时降级到 sliding_window（保留 system + 最近 N 条）。
 """
 
@@ -48,7 +48,7 @@ async def compress_messages(
     压缩流程：
     1. 估算总 token，未超阈值直接返回（不压缩）。
     2. 计算 breakpoint 分界线。
-    3. 对可压缩区中的 tool/function 消息截断、长文本截断。
+    3. 对 breakpoint 之前的旧历史区做 tool/function 消息截断、长文本截断。
     4. 如果仍超阈值，再做 sliding_window（保留 system + 最近消息）。
     5. 当前暂不做 LLM 摘要压缩。
 
@@ -78,16 +78,16 @@ async def compress_messages(
         # 没有可压缩区（breakpoint 在最后），用 fallback 至少保留 system
         breakpoint_idx = _fallback_breakpoint(messages)
 
-    # 稳定区不动，只压缩可压缩区
-    cached_part = messages[:breakpoint_idx]
-    compressible_part = messages[breakpoint_idx:]
+    # 旧历史区可压缩，近期保护区不动。
+    compressible_part = messages[:breakpoint_idx]
+    protected_part = messages[breakpoint_idx:]
 
     # 第一轮：逐消息压缩（tool 截断 + 长文本截断）
     compressed_part = [
-        _compress_message(message, index + breakpoint_idx, len(messages), max_tool_chars)
+        _compress_message(message, index, len(messages), max_tool_chars)
         for index, message in enumerate(compressible_part)
     ]
-    next_messages = cached_part + compressed_part
+    next_messages = compressed_part + protected_part
     compressed_tokens = _estimate_messages_tokens(next_messages)
 
     # 第二轮：如果仍超阈值，做 sliding_window
