@@ -2,20 +2,14 @@ from __future__ import annotations
 
 from collections import deque
 
+from app.memory.tool_guard import DEFAULT_MAX_TOOL_CHARS, truncate_text
 
-MAX_TOOL_RESULT_TOKENS = 4000
+MAX_TOOL_RESULT_TOKENS = DEFAULT_MAX_TOOL_CHARS // 4
 
 
 def truncate_long_tool_result(result_text: str) -> str:
-    """工具结果过长时截断尾部，避免单个工具污染主 loop 上下文。"""
-    # 简化估算：一个 token 约等于 4 个字符，后续可替换为真实 tokenizer。
-    char_limit = MAX_TOOL_RESULT_TOKENS * 4
-    if len(result_text) <= char_limit:
-        return result_text
-
-    head = result_text[: char_limit - 200]
-    tail = "\n\n[工具结果过长已截断，主 loop 可调更窄的查询参数]"
-    return head + tail
+    """兼容旧调用；实际截断规则统一走 app.memory.tool_guard。"""
+    return truncate_text(result_text, max_chars=DEFAULT_MAX_TOOL_CHARS)
 
 
 class LoopDetector:
