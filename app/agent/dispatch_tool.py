@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from uuid import uuid4
 
 from langchain.agents import create_agent
@@ -21,14 +22,23 @@ SUB_AGENT_MAX_ITERATIONS = 12
 
 @tool
 async def dispatch_tool(demands: str) -> str:
-    """派一个同质子 AgentLoop 去执行 demands，并返回它的最终回复。
+    """派一个同质子 AgentLoop 执行 demands，并返回它的最终回复。
 
-    适用条件（任一即可）：
-    1. 能并行：多个子任务可以同时跑。
-    2. 上下文要隔离：子任务输出很大，不应该污染主 loop。
-    3. 调用链 >= 3：子任务自己内部还要多轮 Think -> Act。
+    适用条件：
+    1. 子任务可以并行执行。
+    2. 子任务上下文需要隔离，避免大量结果污染主 loop。
+    3. 子任务内部可能还要多轮 Think -> Act。
     """
-    # 延迟导入可以避免工具注册表和 dispatch_tool 之间形成循环 import。
+    start = time.time()
+    await monitor.report_tool_start("dispatch_tool", {"demands": demands[:200]})
+
+    async def report_dispatch_end() -> None:
+        await monitor.report_tool_end(
+            "dispatch_tool",
+            int((time.time() - start) * 1000),
+        )
+
+    # 延迟导入，避免工具注册表和 dispatch_tool 之间形成循环 import。
     from app.tools.tool_registry import FULL_TOOL_SET
 
     try:
@@ -36,6 +46,11 @@ async def dispatch_tool(demands: str) -> str:
             sub_thread_id = f"sub-{uuid4().hex[:8]}-d{depth}"
             parent_session_dir = get_session_dir()
             if parent_session_dir is None:
+                await monitor.report_error(
+                    "missing_session_dir",
+                    "dispatch_tool requires an active session_dir",
+                )
+                await report_dispatch_end()
                 return "[dispatch_tool 拒绝] 当前没有 session_dir，无法派发子 AgentLoop。"
 
             await monitor.report_fork(sub_thread_id, demands)
@@ -72,13 +87,25 @@ async def dispatch_tool(demands: str) -> str:
 
             messages = result.get("messages") or []
             if not messages:
+                await report_dispatch_end()
                 return ""
 
             final_message = messages[-1]
             content = getattr(final_message, "content", final_message)
+            await report_dispatch_end()
             return str(content)
     except ForkLimitExceeded as exc:
-        # 这里返回字符串，让主 loop 把子任务失败当作普通工具结果处理。
+        await monitor.report_error("fork_limit_exceeded", str(exc))
+        await report_dispatch_end()
         return f"[dispatch_tool 拒绝] {exc}。建议主 loop 自己处理或换一种拆分方式。"
     except asyncio.TimeoutError:
+        await monitor.report_error(
+            "dispatch_tool_timeout",
+            f"dispatch_tool timed out after {SUB_AGENT_TIMEOUT_SEC}s",
+        )
+        await report_dispatch_end()
         return f"[dispatch_tool 超时] 子任务 {SUB_AGENT_TIMEOUT_SEC}s 未完成。建议缩小子任务范围。"
+    except Exception as exc:
+        await monitor.report_error(type(exc).__name__, str(exc))
+        await report_dispatch_end()
+        raise

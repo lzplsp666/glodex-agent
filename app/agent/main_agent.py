@@ -68,6 +68,7 @@ async def run_agent(
     agent = _build_main_agent(system_prompt)
 
     try:
+        await monitor.report_assistant_call(step="thinking", preview=query[:120])
         result = await asyncio.wait_for(
             agent.ainvoke(
                 {
@@ -85,6 +86,12 @@ async def run_agent(
             ),
             timeout=MAIN_AGENT_TIMEOUT_SEC,
         )
+    except asyncio.CancelledError:
+        await monitor.report_task_cancelled()
+        return {
+            "status": "cancelled",
+            "thread_id": thread_id,
+        }
     except asyncio.TimeoutError:
         await monitor.report_error(
             "timeout",
