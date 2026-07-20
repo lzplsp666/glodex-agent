@@ -13,7 +13,7 @@ from app.agent.prompts import get_system_prompt
 from app.api.context import get_session_dir, push_thread_context, reset_thread_context
 from app.api.monitor import monitor
 from app.memory.injector import get_memory_prompt
-from app.memory.short_term_middleware import short_term_memory_middleware
+from app.harness import build_harness_middleware
 
 
 SUB_AGENT_TIMEOUT_SEC = 90
@@ -60,7 +60,7 @@ async def dispatch_tool(demands: str) -> str:
                 tools=FULL_TOOL_SET,
                 # 子 Agent 复用主 Agent 已检索到的记忆快照，避免偏好上下文丢失。
                 system_prompt=get_system_prompt(long_term_preferences=get_memory_prompt()),
-                middleware=[short_term_memory_middleware],
+                middleware=[build_harness_middleware(FULL_TOOL_SET)],
             )
 
             token = push_thread_context(sub_thread_id, parent_session_dir)

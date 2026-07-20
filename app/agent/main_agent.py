@@ -18,7 +18,7 @@ from app.memory.injector import (
     reset_memory_prompt,
     set_memory_prompt,
 )
-from app.memory.short_term_middleware import short_term_memory_middleware
+from app.harness import build_harness_middleware
 from app.memory.store import store
 from app.tools.tool_registry import FULL_TOOL_SET
 from app.utils.path_utils import ensure_session_dir
@@ -35,7 +35,7 @@ def _build_main_agent(system_prompt: str) -> Any:
         # 主 loop 和子 loop 都从同一份 FULL_TOOL_SET 取工具，保证同质 fork。
         tools=FULL_TOOL_SET,
         system_prompt=system_prompt,
-        middleware=[short_term_memory_middleware],
+        middleware=[build_harness_middleware(FULL_TOOL_SET)],
     )
 
 
