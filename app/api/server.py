@@ -1,16 +1,31 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.connection import manager
 from app.api.monitor import monitor
-from app.api.schemas import CancelTaskResponse, TaskRequest, TaskStartResponse
+from app.api.schemas import (
+    CancelTaskResponse,
+    ConversationHistoryResponse,
+    ConversationMessageResponse,
+    TaskRequest,
+    TaskStartResponse,
+)
 from app.api.task_manager import task_manager
+from app.history.store import history_store
 from app.utils.path_utils import ensure_session_dir
 
 
-app = FastAPI(title="Glodex Agent API", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await history_store.close()
+
+
+app = FastAPI(title="Glodex Agent API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,6 +51,33 @@ async def run_task(request: TaskRequest) -> TaskStartResponse:
         user_id=request.user_id,
     )
     return TaskStartResponse(status="started", thread_id=thread_id)
+
+
+@app.get(
+    "/api/threads/{thread_id}/messages",
+    response_model=ConversationHistoryResponse,
+)
+async def get_thread_messages(thread_id: str, limit: int = 100) -> ConversationHistoryResponse:
+    """Return the durable user-visible history for one conversation thread."""
+    try:
+        messages = await history_store.list_messages(thread_id, limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Conversation history is unavailable") from exc
+    return ConversationHistoryResponse(
+        thread_id=thread_id,
+        messages=[
+            ConversationMessageResponse(
+                seq=message.seq,
+                message_id=message.message_id,
+                role=message.role,
+                content=message.content,
+                tool_call_id=message.tool_call_id,
+                tool_name=message.tool_name,
+                created_at=message.created_at,
+            )
+            for message in messages
+        ],
+    )
 
 
 @app.websocket("/ws/{thread_id}")

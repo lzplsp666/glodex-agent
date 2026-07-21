@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from typing import Any, Iterable, Mapping
 
@@ -14,6 +15,7 @@ from app.harness.bootstrap import build_harness
 from app.harness.pipeline import HarnessPipeline
 from app.harness.types import HookContext, HookPoint, HookRejectSignal
 from app.memory.tool_guard import DEFAULT_MAX_TOOL_CHARS
+from app.observability.langfuse import tool_span
 
 
 class HarnessMiddleware(AgentMiddleware):
@@ -100,7 +102,19 @@ class HarnessMiddleware(AgentMiddleware):
                 status="error",
             )
 
-        result = await handler(request)
+        if os.getenv("LANGFUSE_MANUAL_TOOL_SPANS", "0").lower() in {"1", "true", "yes"}:
+            async with tool_span(
+                name=tool_call.get("name", "unknown"),
+                input=dict(tool_call.get("args") or {}),
+                metadata={"tool_call_id": tool_call.get("id")},
+            ) as observation:
+                result = await handler(request)
+                if observation is not None:
+                    observation.update(output={"status": "success"})
+        else:
+            # Langfuse's LangChain CallbackHandler records standard tool events.
+            # Keep manual spans opt-in so a tool is not recorded twice.
+            result = await handler(request)
         context.tool_result = result
         context = await self.pipeline.run(HookPoint.POST_TOOL_CALL, context)
         return context.tool_result

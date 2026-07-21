@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -23,4 +25,19 @@ class CancelTaskResponse(BaseModel):
 
     status: str
     thread_id: str
+
+
+class ConversationMessageResponse(BaseModel):
+    seq: int
+    message_id: str
+    role: str
+    content: str
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    created_at: datetime
+
+
+class ConversationHistoryResponse(BaseModel):
+    thread_id: str
+    messages: list[ConversationMessageResponse]
 

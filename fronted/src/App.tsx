@@ -1,23 +1,25 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
-import { buildWebSocketUrl, cancelTask, startTask } from "./api";
-import type { AguiSocketMessage, ConnectionState, MonitorEvent } from "./types";
+import { buildWebSocketUrl, cancelTask, getConversationHistory, startTask } from "./api";
+import type { AguiSocketMessage, ConnectionState, ConversationMessage, MonitorEvent } from "./types";
+
+const ACTIVE_THREAD_STORAGE_KEY = "glodex.activeThreadId";
 
 const eventLabels: Record<string, string> = {
-  session_created: "已创建会话",
-  assistant_call: "正在思考",
-  tool_start: "正在调用工具",
-  tool_end: "工具已完成",
-  task_result: "回答完成",
-  task_cancelled: "任务已取消",
-  error: "发生错误",
-  fork: "正在处理子任务",
+  session_created: "Session created",
+  assistant_call: "Thinking",
+  tool_start: "Calling tool",
+  tool_end: "Tool completed",
+  task_result: "Answer completed",
+  task_cancelled: "Task cancelled",
+  error: "Error",
+  fork: "Processing subtask",
 };
 
 const starterPrompts = [
-  "帮我挑选 300 元以内的旅行收纳袋",
-  "比较一下适合通勤的降噪耳机",
-  "为我整理一份周末露营装备清单",
+  "Find travel storage bags under 300 RMB",
+  "Compare noise-cancelling headphones for commuting",
+  "Prepare a weekend camping packing list",
 ];
 
 function isMonitorEvent(message: AguiSocketMessage): message is MonitorEvent {
@@ -30,34 +32,52 @@ function getFinalAnswer(event: MonitorEvent): string {
 }
 
 function statusText(state: ConnectionState): string {
-  if (state === "connected") return "工作中";
-  if (state === "starting" || state === "connecting") return "连接中";
-  if (state === "error") return "连接异常";
-  return "就绪";
+  if (state === "connected") return "Working";
+  if (state === "starting" || state === "connecting") return "Connecting";
+  if (state === "error") return "Connection error";
+  return "Ready";
+}
+
+function visibleMessages(messages: ConversationMessage[]): ConversationMessage[] {
+  return messages.filter((message) => message.role === "user" || message.role === "assistant");
 }
 
 export default function App() {
   const [query, setQuery] = useState("");
-  const [activeQuery, setActiveQuery] = useState("");
   const [threadId, setThreadId] = useState("");
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
   const [events, setEvents] = useState<MonitorEvent[]>([]);
   const [finalAnswer, setFinalAnswer] = useState("");
   const [error, setError] = useState("");
   const socketRef = useRef<WebSocket | null>(null);
 
-  const isWorking = connectionState === "starting" || connectionState === "connecting" || connectionState === "connected";
+  const isWorking = ["starting", "connecting", "connected"].includes(connectionState);
   const canStart = query.trim().length > 0 && !isWorking;
-  const hasConversation = Boolean(activeQuery);
+  const chatMessages = visibleMessages(messages);
+  const hasConversation = chatMessages.length > 0;
   const progressEvents = events.filter((event) => event.event !== "task_result").slice(0, 5);
   const wsUrl = useMemo(() => (threadId ? buildWebSocketUrl(threadId) : ""), [threadId]);
 
-  useEffect(() => () => socketRef.current?.close(), []);
+  async function refreshHistory(targetThreadId: string) {
+    const response = await getConversationHistory(targetThreadId);
+    setMessages(response.messages);
+  }
+
+  useEffect(() => {
+    const savedThreadId = window.localStorage.getItem(ACTIVE_THREAD_STORAGE_KEY);
+    if (savedThreadId) {
+      setThreadId(savedThreadId);
+      void refreshHistory(savedThreadId).catch((exc) => {
+        setError(exc instanceof Error ? exc.message : "Unable to restore conversation history");
+      });
+    }
+    return () => socketRef.current?.close();
+  }, []);
 
   function connectSocket(nextThreadId: string) {
     socketRef.current?.close();
     setConnectionState("connecting");
-
     const socket = new WebSocket(buildWebSocketUrl(nextThreadId));
     socketRef.current = socket;
 
@@ -65,29 +85,26 @@ export default function App() {
       setConnectionState("connected");
       socket.send("ping");
     };
-
     socket.onmessage = (messageEvent) => {
       try {
         const message = JSON.parse(messageEvent.data) as AguiSocketMessage;
         if (!isMonitorEvent(message)) return;
-
         setEvents((current) => [message, ...current].slice(0, 100));
         if (message.event === "task_result") {
           setFinalAnswer(getFinalAnswer(message));
           setConnectionState("closed");
+          void refreshHistory(nextThreadId).catch(() => undefined);
         }
         if (message.event === "task_cancelled") setConnectionState("closed");
-        if (message.event === "error") setError(message.message || "后端返回错误事件");
+        if (message.event === "error") setError(message.message || "Backend returned an error");
       } catch (exc) {
-        setError(exc instanceof Error ? exc.message : "无法解析服务端消息");
+        setError(exc instanceof Error ? exc.message : "Unable to parse backend message");
       }
     };
-
     socket.onerror = () => {
       setConnectionState("error");
-      setError("无法连接到 Agent 服务，请确认后端已启动。");
+      setError("Unable to connect to the agent service");
     };
-
     socket.onclose = () => {
       setConnectionState((current) => (current === "connected" || current === "connecting" ? "closed" : current));
     };
@@ -101,17 +118,23 @@ export default function App() {
     setError("");
     setFinalAnswer("");
     setEvents([]);
-    setThreadId("");
-    setActiveQuery(nextQuery);
     setConnectionState("starting");
-
+    setQuery("");
     try {
-      const response = await startTask(nextQuery);
+      const response = await startTask(nextQuery, threadId || undefined);
       setThreadId(response.thread_id);
+      window.localStorage.setItem(ACTIVE_THREAD_STORAGE_KEY, response.thread_id);
+      setMessages((current) => [
+        ...current,
+        {
+          seq: -Date.now(), message_id: `pending-${Date.now()}`, role: "user",
+          content: nextQuery, created_at: new Date().toISOString(),
+        },
+      ]);
       connectSocket(response.thread_id);
     } catch (exc) {
       setConnectionState("error");
-      setError(exc instanceof Error ? exc.message : "启动任务失败");
+      setError(exc instanceof Error ? exc.message : "Unable to start task");
     }
   }
 
@@ -120,15 +143,16 @@ export default function App() {
     try {
       await cancelTask(threadId);
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "取消任务失败");
+      setError(exc instanceof Error ? exc.message : "Unable to cancel task");
     }
   }
 
   function startNewConversation() {
     socketRef.current?.close();
+    window.localStorage.removeItem(ACTIVE_THREAD_STORAGE_KEY);
     setQuery("");
-    setActiveQuery("");
     setThreadId("");
+    setMessages([]);
     setEvents([]);
     setFinalAnswer("");
     setError("");
@@ -138,106 +162,25 @@ export default function App() {
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">G</div>
-          <span>Glodex</span>
-          <span className="brand-subtitle">Agent</span>
-        </div>
-
-        <button className="new-chat-button" type="button" onClick={startNewConversation}>
-          <span>＋</span> 新建对话
-        </button>
-
-        <nav className="sidebar-nav" aria-label="主导航">
-          <button className="nav-item active" type="button"><span>◌</span> 智能对话</button>
-          <button className="nav-item" type="button"><span>⌕</span> 搜索对话</button>
-          <button className="nav-item" type="button"><span>◫</span> 商品发现</button>
-          <button className="nav-item" type="button"><span>◇</span> 偏好记忆</button>
-        </nav>
-
-        <div className="recent-section">
-          <p>最近对话</p>
-          {activeQuery ? <button className="recent-chat" type="button">{activeQuery}</button> : <span>还没有对话记录</span>}
-        </div>
-
-        <div className="sidebar-footer">
-          <span className={`status-dot ${isWorking ? "working" : ""}`} />
-          <span>{statusText(connectionState)}</span>
-        </div>
+        <div className="brand"><div className="brand-mark">G</div><span>Glodex</span><span className="brand-subtitle">Agent</span></div>
+        <button className="new-chat-button" type="button" onClick={startNewConversation}>+ New conversation</button>
+        <div className="recent-section"><p>Recent conversation</p>{chatMessages[0] ? <button className="recent-chat" type="button">{chatMessages[0].content}</button> : <span>No conversation yet</span>}</div>
+        <div className="sidebar-footer"><span className={`status-dot ${isWorking ? "working" : ""}`} /><span>{statusText(connectionState)}</span></div>
       </aside>
 
       <section className="chat-workspace">
-        <header className="workspace-topbar">
-          <div>
-            <p className="workspace-kicker">SHOPPING COPILOT</p>
-            <h1>{hasConversation ? "导购助手" : "Glodex 智能导购"}</h1>
-          </div>
-          <div className="model-badge"><span className="model-dot" /> LangChain Agent</div>
-        </header>
-
+        <header className="workspace-topbar"><div><p className="workspace-kicker">SHOPPING COPILOT</p><h1>{hasConversation ? "Shopping assistant" : "Glodex shopping assistant"}</h1></div><div className="model-badge"><span className="model-dot" /> LangChain Agent</div></header>
         <div className={`conversation ${hasConversation ? "has-conversation" : ""}`}>
-          {!hasConversation ? (
-            <section className="welcome-card">
-              <div className="welcome-icon">✦</div>
-              <p className="welcome-eyebrow">你的购物决策助手</p>
-              <h2>今天想找什么？</h2>
-              <p className="welcome-copy">告诉我预算、偏好或使用场景。我会搜索、比较，并给出清楚的推荐。</p>
-              <div className="starter-grid">
-                {starterPrompts.map((prompt) => (
-                  <button key={prompt} type="button" onClick={() => setQuery(prompt)}>{prompt}<span>↗</span></button>
-                ))}
-              </div>
-            </section>
-          ) : (
-            <section className="message-thread" aria-live="polite">
-              <article className="user-message"><p>{activeQuery}</p></article>
-              <article className="assistant-message">
-                <div className="assistant-avatar">G</div>
-                <div className="assistant-content">
-                  {isWorking ? (
-                    <>
-                      <p className="thinking-title">正在为你查找和比较…</p>
-                      <div className="activity-list">
-                        {progressEvents.length ? progressEvents.map((event, index) => (
-                          <div className="activity-row" key={`${event.timestamp}-${index}`}>
-                            <span className="activity-pulse" />
-                            <span>{eventLabels[event.event] || event.message}</span>
-                            <small>{event.message}</small>
-                          </div>
-                        )) : <div className="activity-row"><span className="activity-pulse" /> 正在准备任务…</div>}
-                      </div>
-                    </>
-                  ) : finalAnswer ? <p className="answer-text">{finalAnswer}</p> : <p className="answer-text muted">{error || "本次任务已结束。"}</p>}
-                </div>
-              </article>
-            </section>
-          )}
+          {!hasConversation ? <section className="welcome-card"><div className="welcome-icon">+</div><p className="welcome-eyebrow">Shopping decision assistant</p><h2>What are you looking for?</h2><div className="starter-grid">{starterPrompts.map((prompt) => <button key={prompt} type="button" onClick={() => setQuery(prompt)}>{prompt}<span>→</span></button>)}</div></section> : <section className="message-thread" aria-live="polite">
+            {chatMessages.map((message) => message.role === "user" ? <article className="user-message" key={message.message_id}><p>{message.content}</p></article> : <article className="assistant-message" key={message.message_id}><div className="assistant-avatar">G</div><div className="assistant-content"><p className="answer-text">{message.content}</p></div></article>)}
+            {isWorking ? <article className="assistant-message"><div className="assistant-avatar">G</div><div className="assistant-content"><p className="thinking-title">Working on your request...</p><div className="activity-list">{progressEvents.map((item, index) => <div className="activity-row" key={`${item.timestamp}-${index}`}><span className="activity-pulse" /><span>{eventLabels[item.event] || item.message}</span><small>{item.message}</small></div>)}</div></div></article> : null}
+            {!isWorking && finalAnswer && !chatMessages.some((message) => message.content === finalAnswer) ? <article className="assistant-message"><div className="assistant-avatar">G</div><div className="assistant-content"><p className="answer-text">{finalAnswer}</p></div></article> : null}
+          </section>}
         </div>
-
         <footer className="composer-area">
           {error ? <div className="error-note">{error}</div> : null}
-          <form className="composer" onSubmit={handleStart}>
-            <textarea
-              aria-label="向 Glodex 提问"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="例如：预算 500 元，想买一副适合通勤的耳机…"
-              rows={2}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  event.currentTarget.form?.requestSubmit();
-                }
-              }}
-            />
-            <div className="composer-actions">
-              <span>Glodex Agent</span>
-              {isWorking ? <button className="stop-button" type="button" onClick={handleCancel}>停止</button> : null}
-              <button className="send-button" type="submit" disabled={!canStart} aria-label="发送问题">↑</button>
-            </div>
-          </form>
-          <p className="composer-hint">Enter 发送 · Shift + Enter 换行</p>
-          {wsUrl ? <span className="sr-only">当前 WebSocket：{wsUrl}</span> : null}
+          <form className="composer" onSubmit={handleStart}><textarea aria-label="Ask Glodex" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="For example: find headphones under 500 RMB" rows={2} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /><div className="composer-actions"><span>Glodex Agent</span>{isWorking ? <button className="stop-button" type="button" onClick={handleCancel}>Stop</button> : null}<button className="send-button" type="submit" disabled={!canStart} aria-label="Send">→</button></div></form>
+          <p className="composer-hint">Enter to send · Shift + Enter for a new line</p>{wsUrl ? <span className="sr-only">Current WebSocket: {wsUrl}</span> : null}
         </footer>
       </section>
     </main>

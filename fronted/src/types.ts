@@ -27,4 +27,19 @@ export type TaskStartResponse = {
   thread_id: string;
 };
 
+export type ConversationMessage = {
+  seq: number;
+  message_id: string;
+  role: "user" | "assistant" | "tool";
+  content: string;
+  tool_call_id?: string | null;
+  tool_name?: string | null;
+  created_at: string;
+};
+
+export type ConversationHistoryResponse = {
+  thread_id: string;
+  messages: ConversationMessage[];
+};
+
 export type ConnectionState = "idle" | "starting" | "connecting" | "connected" | "closed" | "error";

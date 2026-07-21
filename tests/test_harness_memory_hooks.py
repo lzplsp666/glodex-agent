@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import pytest
+from langchain_core.messages import SystemMessage
 
 from app.harness.hooks.memory import (
+    SESSION_MEMORY_MESSAGE_FLAG,
+    compress_context,
     initialize_session_memory,
     persist_final_session_snapshot,
 )
@@ -43,3 +46,61 @@ async def test_session_end_records_event(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert events[0][0:2] == ("thread-1", "session_end")
     assert events[0][2]["model_call_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_compression_injects_one_latest_task_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    persisted_snapshots: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "app.harness.hooks.memory.session_memory.append_snapshot",
+        lambda *args, **kwargs: persisted_snapshots.append(kwargs["snapshot"]),
+    )
+    context = HookContext(
+        thread_id="thread-1",
+        messages=[
+            SystemMessage(content="base instructions"),
+            {"role": "user", "content": "find a laptop under 1000"},
+            {"role": "assistant", "content": "I will compare available options."},
+            {"role": "tool", "content": "candidate A price 899 url https://example.com"},
+        ],
+        metadata={
+            "max_context_tokens": 1,
+            "keep_recent_tool_calls": 0,
+            "max_tool_chars": 100,
+        },
+    )
+
+    await compress_context(context)
+    await compress_context(context)
+
+    state_messages = [
+        message
+        for message in context.messages
+        if isinstance(message, SystemMessage)
+        and message.additional_kwargs.get(SESSION_MEMORY_MESSAGE_FLAG)
+    ]
+    assert len(state_messages) == 1
+    assert "当前任务状态" in state_messages[0].content
+    assert context.session_state["current_task_snapshot"] == persisted_snapshots[-1]
+    assert len(persisted_snapshots) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_compression_does_not_inject_task_state() -> None:
+    context = HookContext(
+        messages=[{"role": "user", "content": "short request"}],
+        metadata={
+            "max_context_tokens": 100,
+            "keep_recent_tool_calls": 3,
+        },
+    )
+
+    await compress_context(context)
+
+    assert not context.session_state.get("current_task_snapshot")
+    assert not any(
+        getattr(message, "additional_kwargs", {}).get(SESSION_MEMORY_MESSAGE_FLAG)
+        for message in context.messages
+    )

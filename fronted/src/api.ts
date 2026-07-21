@@ -1,4 +1,4 @@
-import type { TaskStartResponse } from "./types";
+import type { ConversationHistoryResponse, TaskStartResponse } from "./types";
 
 const DEFAULT_API_BASE_URL = "http://localhost:8000";
 
@@ -14,19 +14,27 @@ export function buildWebSocketUrl(threadId: string): string {
   return url.toString();
 }
 
-export async function startTask(query: string): Promise<TaskStartResponse> {
+export async function startTask(query: string, threadId?: string): Promise<TaskStartResponse> {
   const response = await fetch(`${API_BASE_URL}/api/task`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({ query, thread_id: threadId }),
   });
 
   if (!response.ok) {
     throw new Error(`启动任务失败：HTTP ${response.status}`);
   }
 
+  return response.json();
+}
+
+export async function getConversationHistory(threadId: string): Promise<ConversationHistoryResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/threads/${encodeURIComponent(threadId)}/messages`);
+  if (!response.ok) {
+    throw new Error(`Unable to load conversation history: HTTP ${response.status}`);
+  }
   return response.json();
 }
 

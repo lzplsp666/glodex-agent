@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,8 +11,13 @@ from app.api.context import get_thread_id
 from app.harness.decorators import harness_hook
 from app.harness.types import HookContext, HookPoint
 from app.memory.compressor import compress_messages
-from app.memory.session import session_memory
+from app.memory.session import build_session_memory_snapshot, session_memory
 from app.memory.tool_guard import DEFAULT_MAX_TOOL_CHARS
+from langchain_core.messages import SystemMessage
+
+
+SESSION_MEMORY_MESSAGE_FLAG = "glodex_session_memory"
+SESSION_MEMORY_MAX_CHARS = 1600
 
 
 @harness_hook(HookPoint.ON_SESSION_START, name="session_memory_init", priority=10)
@@ -37,8 +44,9 @@ async def compress_context(context: HookContext) -> HookContext | None:
     if not context.messages:
         return None
 
+    source_messages = _without_session_memory_message(context.messages)
     result = await compress_messages(
-        context.messages,
+        source_messages,
         max_tokens=context.metadata["max_context_tokens"],
         keep_recent_tool_calls=context.metadata["keep_recent_tool_calls"],
         max_tool_chars=context.metadata.get("max_tool_chars", DEFAULT_MAX_TOOL_CHARS),
@@ -46,9 +54,11 @@ async def compress_context(context: HookContext) -> HookContext | None:
     if result.strategy == "none":
         return None
 
-    _append_session_snapshot(
-        context.thread_id,
-        context.messages,
+    snapshot = build_session_memory_snapshot(source_messages)
+    _persist_session_snapshot(
+        context,
+        source_messages,
+        snapshot,
         {
             "strategy": result.strategy,
             "original_tokens": result.original_tokens,
@@ -58,7 +68,8 @@ async def compress_context(context: HookContext) -> HookContext | None:
             "message_count_after": len(result.messages),
         },
     )
-    context.messages = result.messages
+    context.messages = _inject_session_memory_message(result.messages, snapshot)
+    context.session_state["current_task_snapshot"] = snapshot
     context.session_state["compression_count"] = (
         int(context.session_state.get("compression_count", 0)) + 1
     )
@@ -73,29 +84,123 @@ async def persist_final_session_snapshot(context: HookContext) -> HookContext | 
     if not active_thread_id:
         return None
 
+    source_messages = _without_session_memory_message(context.messages)
+    snapshot = build_session_memory_snapshot(source_messages)
     metadata = {
-        **context.session_state,
+        **_snapshot_metadata(context.session_state),
         "message_count": len(context.messages),
         "snapshot_phase": "final",
     }
     try:
-        session_memory.append_snapshot(active_thread_id, context.messages, metadata=metadata)
+        _persist_session_snapshot(context, source_messages, snapshot, metadata)
         session_memory.append_event(active_thread_id, "session_end", metadata)
     except Exception:
         return None
     return context
 
 
-def _append_session_snapshot(
-    thread_id: str | None,
+def _persist_session_snapshot(
+    context: HookContext,
     messages: list[Any],
+    snapshot: dict[str, Any],
     metadata: dict[str, Any],
-) -> None:
-    active_thread_id = thread_id or get_thread_id()
-    if not active_thread_id:
-        return
+) -> bool:
+    """Append a changed snapshot and only advance the durable hash after success."""
+    active_thread_id = context.thread_id or get_thread_id()
+    if not active_thread_id or not any(snapshot.values()):
+        return False
+    snapshot_hash = _snapshot_hash(snapshot)
+    if context.session_state.get("last_snapshot_hash") == snapshot_hash:
+        return False
     try:
-        session_memory.append_snapshot(active_thread_id, messages, metadata=metadata)
+        session_memory.append_snapshot(
+            active_thread_id,
+            messages,
+            metadata={**metadata, "snapshot_hash": snapshot_hash},
+            snapshot=snapshot,
+        )
     except Exception:
         # Session memory is auxiliary and must never break an agent turn.
-        return
+        return False
+    context.session_state["last_snapshot_hash"] = snapshot_hash
+    return True
+
+
+def _snapshot_hash(snapshot: dict[str, Any]) -> str:
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _snapshot_metadata(session_state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in session_state.items()
+        if key not in {"current_task_snapshot", "last_snapshot_hash"}
+    }
+
+
+def _inject_session_memory_message(
+    messages: list[Any], snapshot: dict[str, Any]
+) -> list[Any]:
+    """Add the latest L3 task state after the stable system prompt."""
+    message = _build_session_memory_message(snapshot)
+    if message is None:
+        return list(messages)
+
+    cleaned_messages = _without_session_memory_message(messages)
+    insert_at = 0
+    while (
+        insert_at < len(cleaned_messages)
+        and _message_role(cleaned_messages[insert_at]) == "system"
+    ):
+        insert_at += 1
+    return [*cleaned_messages[:insert_at], message, *cleaned_messages[insert_at:]]
+
+
+def _build_session_memory_message(snapshot: dict[str, Any]) -> SystemMessage | None:
+    """Format a bounded, model-visible L3 task state from a snapshot."""
+    if not any(snapshot.values()):
+        return None
+
+    labels = (
+        ("目标", "user_goal"),
+        ("约束", "constraints"),
+        ("已完成", "completed_steps"),
+        ("关键发现", "key_findings"),
+        ("候选项", "candidates"),
+        ("决策", "decisions"),
+        ("下一步", "next_steps"),
+    )
+    lines = ["当前任务状态（系统维护，供继续执行时参考）："]
+    for label, key in labels:
+        value = snapshot.get(key)
+        if not value:
+            continue
+        text = "；".join(map(str, value)) if isinstance(value, list) else str(value)
+        lines.append(f"- {label}：{text}")
+
+    content = "\n".join(lines)
+    if len(content) > SESSION_MEMORY_MAX_CHARS:
+        content = content[:SESSION_MEMORY_MAX_CHARS].rstrip() + "..."
+    return SystemMessage(
+        content=content,
+        additional_kwargs={SESSION_MEMORY_MESSAGE_FLAG: True},
+    )
+
+
+def _without_session_memory_message(messages: list[Any]) -> list[Any]:
+    return [message for message in messages if not _is_session_memory_message(message)]
+
+
+def _is_session_memory_message(message: Any) -> bool:
+    if isinstance(message, dict):
+        metadata = message.get("additional_kwargs", {})
+    else:
+        metadata = getattr(message, "additional_kwargs", {})
+    return isinstance(metadata, dict) and metadata.get(SESSION_MEMORY_MESSAGE_FLAG) is True
+
+
+def _message_role(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("role", ""))
+    return str(getattr(message, "type", getattr(message, "role", "")))

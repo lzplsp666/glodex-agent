@@ -60,13 +60,14 @@ class SessionMemory:
         thread_id: str,
         messages: list[Any],
         metadata: dict[str, Any] | None = None,
+        snapshot: dict[str, Any] | None = None,
     ) -> None:
         """记录压缩前仍需要保留的当前任务状态摘要。
 
         这不是完整对话记录，也不是长期记忆。它只保存被压缩历史中
         后续任务可能仍需要知道的结构化信息。
         """
-        snapshot = build_session_memory_snapshot(messages)
+        snapshot = snapshot if snapshot is not None else build_session_memory_snapshot(messages)
         if not any(snapshot.values()):
             return
         self.append_event(

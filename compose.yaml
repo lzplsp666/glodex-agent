@@ -87,6 +87,11 @@ services:
       MYSQL_DATABASE: glodex_agent
       MYSQL_USER: glodex
       MYSQL_PASSWORD: glodex_password
+      LANGFUSE_BASE_URL: http://langfuse:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_TRACING_ENVIRONMENT: ${LANGFUSE_TRACING_ENVIRONMENT:-development}
+      LANGFUSE_MANUAL_TOOL_SPANS: ${LANGFUSE_MANUAL_TOOL_SPANS:-0}
       TZ: Asia/Shanghai
     ports:
       - "3306:3306"

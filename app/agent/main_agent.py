@@ -19,13 +19,16 @@ from app.memory.injector import (
     set_memory_prompt,
 )
 from app.harness import build_harness_middleware
+from app.history.store import history_store
 from app.memory.store import store
 from app.tools.tool_registry import FULL_TOOL_SET
 from app.utils.path_utils import ensure_session_dir
+from app.observability.langfuse import is_langfuse_enabled, record_error
 
 
 MAIN_AGENT_MAX_ITERATIONS = 30
 MAIN_AGENT_TIMEOUT_SEC = 300
+HISTORY_REPLAY_LIMIT = 20
 
 
 def _build_main_agent(system_prompt: str) -> Any:
@@ -37,6 +40,17 @@ def _build_main_agent(system_prompt: str) -> Any:
         system_prompt=system_prompt,
         middleware=[build_harness_middleware(FULL_TOOL_SET)],
     )
+
+
+def _langfuse_callback() -> Any | None:
+    if not is_langfuse_enabled():
+        return None
+    try:
+        from langfuse.langchain import CallbackHandler
+
+        return CallbackHandler()
+    except Exception:
+        return None
 
 
 def _get_final_text(result: dict[str, Any]) -> str:
@@ -66,33 +80,46 @@ async def run_agent(
 
     system_prompt = get_system_prompt(long_term_preferences=pref_text)
     agent = _build_main_agent(system_prompt)
+    try:
+        previous_messages = await history_store.recent_agent_messages(
+            thread_id,
+            limit=HISTORY_REPLAY_LIMIT,
+        )
+    except Exception as exc:
+        await monitor.report_error("history_read_failed", str(exc))
+        previous_messages = []
 
     try:
         await monitor.report_assistant_call(step="thinking", preview=query[:120])
+        invoke_config: dict[str, Any] = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": MAIN_AGENT_MAX_ITERATIONS,
+            "metadata": {"application": "glodex", "thread_id": thread_id},
+        }
+        callback = _langfuse_callback()
+        if callback is not None:
+            invoke_config["callbacks"] = [callback]
         result = await asyncio.wait_for(
             agent.ainvoke(
                 {
                     "messages": [
+                        *previous_messages,
                         {"role": "user", "content": query},
                     ],
                 },
-                config={
-                    "configurable": {
-                        "thread_id": thread_id,
-                    },
-                    # 限制 Agent 循环次数，避免工具调用或模型思考陷入无限循环。
-                    "recursion_limit": MAIN_AGENT_MAX_ITERATIONS,
-                },
+                config=invoke_config,
             ),
             timeout=MAIN_AGENT_TIMEOUT_SEC,
         )
     except asyncio.CancelledError:
+        record_error(asyncio.CancelledError())
         await monitor.report_task_cancelled()
         return {
             "status": "cancelled",
             "thread_id": thread_id,
         }
     except asyncio.TimeoutError:
+        record_error(asyncio.TimeoutError())
         await monitor.report_error(
             "timeout",
             f"主任务超时 {MAIN_AGENT_TIMEOUT_SEC} 秒",
@@ -102,6 +129,7 @@ async def run_agent(
             "thread_id": thread_id,
         }
     except Exception as exc:
+        record_error(exc)
         await monitor.report_error(type(exc).__name__, str(exc))
         return {
             "status": "error",
