@@ -1,7 +1,8 @@
-"""Memory hygiene controls owned by the Harness."""
+"""Short-term memory controls owned by the Harness."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.api.context import get_thread_id
@@ -12,9 +13,27 @@ from app.memory.session import session_memory
 from app.memory.tool_guard import DEFAULT_MAX_TOOL_CHARS
 
 
+@harness_hook(HookPoint.ON_SESSION_START, name="session_memory_init", priority=10)
+async def initialize_session_memory(context: HookContext) -> HookContext:
+    """Reset transient bookkeeping for one agent session."""
+    context.session_state.clear()
+    context.session_state.update(
+        {
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "model_call_count": 0,
+            "compression_count": 0,
+            "artifact_count": 0,
+        }
+    )
+    return context
+
+
 @harness_hook(HookPoint.PRE_MODEL_CALL, name="context_compression", priority=20)
 async def compress_context(context: HookContext) -> HookContext | None:
     """Compress oversized state before the next model invocation."""
+    context.session_state["model_call_count"] = (
+        int(context.session_state.get("model_call_count", 0)) + 1
+    )
     if not context.messages:
         return None
 
@@ -40,7 +59,30 @@ async def compress_context(context: HookContext) -> HookContext | None:
         },
     )
     context.messages = result.messages
+    context.session_state["compression_count"] = (
+        int(context.session_state.get("compression_count", 0)) + 1
+    )
     context.metadata["messages_compressed"] = True
+    return context
+
+
+@harness_hook(HookPoint.ON_SESSION_END, name="session_memory_finalize", priority=10)
+async def persist_final_session_snapshot(context: HookContext) -> HookContext | None:
+    """Record a final short-term-memory snapshot for a completed agent run."""
+    active_thread_id = context.thread_id or get_thread_id()
+    if not active_thread_id:
+        return None
+
+    metadata = {
+        **context.session_state,
+        "message_count": len(context.messages),
+        "snapshot_phase": "final",
+    }
+    try:
+        session_memory.append_snapshot(active_thread_id, context.messages, metadata=metadata)
+        session_memory.append_event(active_thread_id, "session_end", metadata)
+    except Exception:
+        return None
     return context
 
 

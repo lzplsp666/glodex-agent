@@ -10,9 +10,11 @@ from typing import Any, Awaitable, Callable
 class HookPoint(StrEnum):
     """Lifecycle points currently exposed by the Harness."""
 
+    ON_SESSION_START = "on_session_start"
     PRE_MODEL_CALL = "pre_model_call"
     PRE_TOOL_CALL = "pre_tool_call"
     POST_TOOL_CALL = "post_tool_call"
+    ON_SESSION_END = "on_session_end"
 
 
 @dataclass
@@ -25,6 +27,7 @@ class HookContext:
     tool_args: dict[str, Any] = field(default_factory=dict)
     tool_result: Any = None
     loop_state: dict[str, Any] = field(default_factory=dict)
+    session_state: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

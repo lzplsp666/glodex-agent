@@ -6,11 +6,11 @@ import inspect
 from types import ModuleType
 
 from app.harness.decorators import HookRegistration
-from app.harness.hooks import memory, schema_validation, tool
+from app.harness.hooks import memory, schema_validation, tool, tool_result_storage
 from app.harness.pipeline import HarnessPipeline
 
 
-HOOK_MODULES: tuple[ModuleType, ...] = (tool, schema_validation, memory)
+HOOK_MODULES: tuple[ModuleType, ...] = (tool, schema_validation, tool_result_storage, memory)
 
 
 def build_harness() -> HarnessPipeline:

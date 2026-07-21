@@ -12,6 +12,7 @@ from app.tools.item_search import item_search
 from app.tools.price_compare import price_compare
 # from app.tools.shipping_calc import shipping_calc
 from app.tools.shopping_summary import shopping_summary
+from app.tools.read_tool_result import read_tool_result
 
 from app.agent.dispatch_tool import dispatch_tool
 
@@ -27,5 +28,6 @@ FULL_TOOL_SET: list[Any] = [
     price_compare,
     # shipping_calc,
     shopping_summary,
+    read_tool_result,
     dispatch_tool,
 ]
